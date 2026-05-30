@@ -332,18 +332,84 @@ func (c *Client) DeleteIssue(ctx context.Context, ownerSlashRepo string, issueID
 }
 
 // ListLabels lists available labels for the specified repository.
+// Resolves label definition records to get the human-readable name,
+// falling back to the rkey for newer labels that use human-readable rkeys.
 func (c *Client) ListLabels(ctx context.Context, ownerSlashRepo string) ([]string, error) {
 	repoInfo, err := c.ResolveRepo(ctx, ownerSlashRepo)
 	if err != nil {
 		return nil, err
 	}
 
+	if len(repoInfo.Labels) == 0 {
+		return nil, nil
+	}
+
+	// Resolve the label owner's PDS from the first label URI
+	// Label URIs look like: at://did:plc:.../sh.tangled.label.definition/rkey
+	labelOwnerDID, _ := extractDIDFromATURI(repoInfo.Labels[0])
+	if labelOwnerDID == "" {
+		// Fallback: just use rkeys
+		return labelRkeys(repoInfo.Labels), nil
+	}
+
+	pdsURL, err := resolvePDS(ctx, labelOwnerDID)
+	if err != nil {
+		return labelRkeys(repoInfo.Labels), nil
+	}
+
+	// Fetch label definitions to resolve TID rkeys to names
+	accessToken := ""
+	if c.IsAuthenticated() {
+		accessToken = c.accessJWT
+	}
+	records, err := pdsListRecords(ctx, pdsURL, labelOwnerDID, "sh.tangled.label.definition", 100, accessToken)
+	if err != nil {
+		return labelRkeys(repoInfo.Labels), nil
+	}
+
+	// Build rkey -> name map
+	rkeyToName := make(map[string]string)
+	for _, rec := range records {
+		rkey, _ := extractRkey(rec.URI)
+		name, _ := rec.Value["name"].(string)
+		if name == "" {
+			name = rkey
+		}
+		rkeyToName[rkey] = name
+	}
+
 	labels := make([]string, 0, len(repoInfo.Labels))
 	for _, uri := range repoInfo.Labels {
-		parts := strings.Split(uri, "/")
-		labels = append(labels, parts[len(parts)-1])
+		rkey, _ := extractRkey(uri)
+		if name, ok := rkeyToName[rkey]; ok {
+			labels = append(labels, name)
+		} else {
+			labels = append(labels, rkey)
+		}
 	}
 	return labels, nil
+}
+
+// labelRkeys extracts rkeys from label URIs as a fallback.
+func labelRkeys(uris []string) []string {
+	labels := make([]string, 0, len(uris))
+	for _, uri := range uris {
+		rkey, _ := extractRkey(uri)
+		labels = append(labels, rkey)
+	}
+	return labels
+}
+
+// extractDIDFromATURI extracts the DID from an AT-URI (at://did:plc:.../collection/rkey).
+func extractDIDFromATURI(uri string) (string, error) {
+	if !strings.HasPrefix(uri, "at://") {
+		return "", fmt.Errorf("not an AT-URI: %q", uri)
+	}
+	parts := strings.SplitN(uri, "/", 3)
+	if len(parts) < 3 {
+		return "", fmt.Errorf("invalid AT-URI: %q", uri)
+	}
+	return parts[2], nil
 }
 
 // rawRecordToIssue converts a raw pdsRecord to an Issue.
@@ -360,21 +426,47 @@ func rawRecordToIssue(rec pdsRecord) *Issue {
 }
 
 // nextIssueID determines the next sequential issue ID for a repo.
+// It queries both the authenticated user's PDS and the repo owner's PDS
+// to find the highest existing issue ID.
+// Note: Issues from other contributors on different PDS instances may not be visible,
+// so the ID could conflict. The Tangled appview tracks the definitive ID sequence.
 func (c *Client) nextIssueID(ctx context.Context, repoInfo *RepoInfo) (int, error) {
-	records, err := c.pdsListRecords(ctx, CollectionIssue, 100)
-	if err != nil {
-		return 0, fmt.Errorf("failed to list existing issues: %w", err)
+	maxID := 0
+
+	// Check authenticated user's PDS
+	authRecords, err := c.pdsListRecords(ctx, CollectionIssue, 100)
+	if err == nil {
+		for _, rec := range authRecords {
+			repo, _ := rec.Value["repo"].(string)
+			if !repoRefMatches(repo, repoInfo) {
+				continue
+			}
+			id := int(jsonFloat(rec.Value, "issueId"))
+			if id > maxID {
+				maxID = id
+			}
+		}
 	}
 
-	maxID := 0
-	for _, rec := range records {
-		repo, _ := rec.Value["repo"].(string)
-		if !repoRefMatches(repo, repoInfo) {
-			continue
+	// Check repo owner's PDS (may have issues from other collaborators on the same PDS)
+	ownerPDS, err := resolvePDS(ctx, repoInfo.DID)
+	if err == nil {
+		accessToken := ""
+		if c.IsAuthenticated() {
+			accessToken = c.accessJWT
 		}
-		id := int(jsonFloat(rec.Value, "issueId"))
-		if id > maxID {
-			maxID = id
+		ownerRecords, err := pdsListRecords(ctx, ownerPDS, repoInfo.DID, CollectionIssue, 100, accessToken)
+		if err == nil {
+			for _, rec := range ownerRecords {
+				repo, _ := rec.Value["repo"].(string)
+				if !repoRefMatches(repo, repoInfo) {
+					continue
+				}
+				id := int(jsonFloat(rec.Value, "issueId"))
+				if id > maxID {
+					maxID = id
+				}
+			}
 		}
 	}
 
