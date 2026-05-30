@@ -1,15 +1,16 @@
 package tangled
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	comatproto "github.com/bluesky-social/indigo/api/atproto"
-	lexutil "github.com/bluesky-social/indigo/lex/util"
 	"github.com/bluesky-social/indigo/xrpc"
 )
 
@@ -33,13 +34,17 @@ const (
 	DefaultPDS = "https://bsky.social"
 )
 
+// httpClient is the shared HTTP client with sensible timeouts.
+var httpClient = &http.Client{Timeout: 30 * time.Second}
+
 // Client is a Tangled API client that authenticates via AT Protocol
 // and provides operations for issues, pull requests, and branches.
 type Client struct {
-	xrpc    *xrpc.Client
-	did     string
-	handle  string
-	pdsHost string
+	xrpc      *xrpc.Client
+	did       string
+	handle    string
+	pdsHost   string
+	accessJWT string
 }
 
 // Config holds the configuration for creating a new Client.
@@ -86,10 +91,11 @@ func NewClient(ctx context.Context, cfg Config) (*Client, error) {
 	}
 
 	return &Client{
-		xrpc:    xrpcClient,
-		did:     session.Did,
-		handle:  session.Handle,
-		pdsHost: pdsHost,
+		xrpc:      xrpcClient,
+		did:       session.Did,
+		handle:    session.Handle,
+		pdsHost:   pdsHost,
+		accessJWT: session.AccessJwt,
 	}, nil
 }
 
@@ -115,10 +121,18 @@ func (c *Client) IsAuthenticated() bool {
 	return c.xrpc != nil && c.xrpc.Auth != nil
 }
 
+// requireAuth returns an error if the client is not authenticated.
+func (c *Client) requireAuth() error {
+	if !c.IsAuthenticated() {
+		return fmt.Errorf("authentication required")
+	}
+	return nil
+}
+
 // getServiceToken obtains a service auth token for authenticating with Tangled knots.
 func (c *Client) getServiceToken(ctx context.Context) (string, error) {
-	if !c.IsAuthenticated() {
-		return "", fmt.Errorf("authentication required")
+	if err := c.requireAuth(); err != nil {
+		return "", err
 	}
 	out, err := comatproto.ServerGetServiceAuth(ctx, c.xrpc, TangledDID, 0, "")
 	if err != nil {
@@ -137,56 +151,124 @@ func (c *Client) ResolveRepo(ctx context.Context, ownerSlashRepo string) (*RepoI
 	owner, repoName, _ := strings.Cut(ownerSlashRepo, "/")
 	owner = strings.TrimPrefix(owner, "@")
 
-	// Resolve owner handle to DID
 	ownerDID, err := c.resolveDID(ctx, owner)
 	if err != nil {
 		return nil, err
 	}
 
-	// Query the owner's PDS for repo records
-	if c.IsAuthenticated() {
-		return c.resolveRepoAuthenticated(ctx, ownerDID, repoName)
-	}
-	return c.resolveRepoPublic(ctx, ownerDID, repoName)
-}
-
-// resolveRepoAuthenticated resolves a repo using an authenticated atproto client.
-func (c *Client) resolveRepoAuthenticated(ctx context.Context, ownerDID, repoName string) (*RepoInfo, error) {
-	records, err := comatproto.RepoListRecords(ctx, c.xrpc, CollectionRepo, "", 100, ownerDID, false)
-	if err != nil {
-		return nil, fmt.Errorf("failed to list repos: %w", err)
-	}
-
-	for _, rec := range records.Records {
-		m := recordToMap(rec)
-		name, _ := m["name"].(string)
-		if name != repoName {
-			continue
-		}
-		return buildRepoInfo(rec.Uri, rec.Cid, m, ownerDID, repoName), nil
-	}
-
-	return nil, fmt.Errorf("repo %q not found for owner DID %s", repoName, ownerDID)
-}
-
-// resolveRepoPublic resolves a repo using public PDS HTTP endpoints.
-func (c *Client) resolveRepoPublic(ctx context.Context, ownerDID, repoName string) (*RepoInfo, error) {
 	pdsURL, err := resolvePDS(ctx, ownerDID)
 	if err != nil {
 		return nil, err
 	}
 
-	url := fmt.Sprintf("%s/xrpc/com.atproto.repo.listRecords?repo=%s&collection=%s&limit=100",
-		pdsURL, ownerDID, CollectionRepo)
+	// Always use raw HTTP — avoids indigo's LexiconTypeDecoder which requires
+	// registered types that Tangled collections don't have.
+	records, err := pdsListRecords(ctx, pdsURL, ownerDID, CollectionRepo, 100, "")
+	if err != nil {
+		return nil, fmt.Errorf("failed to list repos for %q: %w", owner, err)
+	}
+
+	for _, rec := range records {
+		name, _ := rec.Value["name"].(string)
+
+		// Newer Tangled repos use the rkey as the repo name and omit the "name" field.
+		// Older repos use a TID rkey with an explicit "name" field.
+		if name == "" {
+			rkey, _ := extractRkey(rec.URI)
+			name = rkey
+		}
+
+		if name != repoName {
+			continue
+		}
+		return buildRepoInfo(rec.URI, rec.CID, rec.Value, ownerDID, repoName), nil
+	}
+
+	return nil, fmt.Errorf("repo %q not found for owner %q", repoName, owner)
+}
+
+// ListMyRepos lists the authenticated user's Tangled repositories.
+func (c *Client) ListMyRepos(ctx context.Context) ([]*RepoInfo, error) {
+	if err := c.requireAuth(); err != nil {
+		return nil, err
+	}
+
+	records, err := c.pdsListRecords(ctx, CollectionRepo, 100)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list repos: %w", err)
+	}
+
+	var repos []*RepoInfo
+	for _, rec := range records {
+		name, _ := rec.Value["name"].(string)
+		knot, _ := rec.Value["knot"].(string)
+
+		// Newer Tangled repos use the rkey as the repo name and omit the "name" field.
+		if name == "" {
+			rkey, _ := extractRkey(rec.URI)
+			name = rkey
+		}
+
+		if name == "" || knot == "" {
+			continue
+		}
+		repos = append(repos, buildRepoInfo(rec.URI, rec.CID, rec.Value, c.did, name))
+	}
+	return repos, nil
+}
+
+// resolveDID resolves a handle or DID to a DID.
+func (c *Client) resolveDID(ctx context.Context, owner string) (string, error) {
+	if strings.HasPrefix(owner, "did:") {
+		return owner, nil
+	}
+	if c.IsAuthenticated() {
+		resp, err := comatproto.IdentityResolveHandle(ctx, c.xrpc, owner)
+		if err != nil {
+			return "", fmt.Errorf("failed to resolve handle %q: %w", owner, err)
+		}
+		return resp.Did, nil
+	}
+	return resolveHandlePublic(ctx, owner)
+}
+
+// ---- Raw PDS HTTP helpers ----
+// These bypass indigo's xrpc type system entirely, since Tangled's custom
+// lexicon types (sh.tangled.*) aren't registered with indigo's LexiconTypeDecoder.
+
+// pdsRecord represents a single record from the PDS listRecords API.
+type pdsRecord struct {
+	URI   string         `json:"uri"`
+	CID   string         `json:"cid"`
+	Value map[string]any `json:"value"`
+}
+
+// pdsListRecordsAuthenticated lists records from the authenticated user's PDS.
+func (c *Client) pdsListRecords(ctx context.Context, collection string, limit int) ([]pdsRecord, error) {
+	pdsURL, err := resolvePDS(ctx, c.did)
+	if err != nil {
+		return nil, err
+	}
+	return pdsListRecords(ctx, pdsURL, c.did, collection, limit, c.accessJWT)
+}
+
+// pdsListRecords lists records via raw HTTP to a PDS endpoint.
+// If accessToken is empty, the request is made without authentication.
+func pdsListRecords(ctx context.Context, pdsURL, repo, collection string, limit int, accessToken string) ([]pdsRecord, error) {
+	url := fmt.Sprintf("%s/xrpc/com.atproto.repo.listRecords?repo=%s&collection=%s&limit=%d",
+		pdsURL, repo, collection, limit)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
 	}
+	if accessToken != "" {
+		req.Header.Set("Authorization", "Bearer "+accessToken)
+	}
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("failed to query PDS: %w", err)
+		return nil, fmt.Errorf("PDS request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
@@ -196,25 +278,111 @@ func (c *Client) resolveRepoPublic(ctx context.Context, ownerDID, repoName strin
 	}
 
 	var result struct {
-		Records []struct {
-			URI   string         `json:"uri"`
-			CID   string         `json:"cid"`
-			Value map[string]any `json:"value"`
-		} `json:"records"`
+		Records []pdsRecord `json:"records"`
+		Cursor  *string     `json:"cursor,omitempty"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return nil, fmt.Errorf("failed to decode PDS response: %w", err)
 	}
+	return result.Records, nil
+}
 
-	for _, rec := range result.Records {
-		name, _ := rec.Value["name"].(string)
-		if name != repoName {
-			continue
-		}
-		return buildRepoInfo(rec.URI, rec.CID, rec.Value, ownerDID, repoName), nil
+// pdsPutRecord creates or replaces a record via raw HTTP to a PDS endpoint.
+func (c *Client) pdsPutRecord(ctx context.Context, collection, rkey string, record map[string]any, swapRecord *string) (uri, cid string, err error) {
+	if err := c.requireAuth(); err != nil {
+		return "", "", err
 	}
 
-	return nil, fmt.Errorf("repo %q not found for owner DID %s", repoName, ownerDID)
+	pdsURL, err := resolvePDS(ctx, c.did)
+	if err != nil {
+		return "", "", err
+	}
+
+	body := map[string]any{
+		"repo":       c.did,
+		"collection":  collection,
+		"rkey":        rkey,
+		"record":      record,
+	}
+	if swapRecord != nil {
+		body["swapRecord"] = *swapRecord
+	}
+
+	bodyBytes, err := json.Marshal(body)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	url := pdsURL + "/xrpc/com.atproto.repo.putRecord"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return "", "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+c.accessJWT)
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return "", "", fmt.Errorf("PDS putRecord failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		return "", "", fmt.Errorf("PDS putRecord returned HTTP %d: %s", resp.StatusCode, respBody)
+	}
+
+	var result struct {
+		URI string `json:"uri"`
+		CID string `json:"cid"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", "", fmt.Errorf("failed to decode putRecord response: %w", err)
+	}
+	return result.URI, result.CID, nil
+}
+
+// pdsDeleteRecord deletes a record via raw HTTP to a PDS endpoint.
+func (c *Client) pdsDeleteRecord(ctx context.Context, collection, rkey string) error {
+	if err := c.requireAuth(); err != nil {
+		return err
+	}
+
+	pdsURL, err := resolvePDS(ctx, c.did)
+	if err != nil {
+		return err
+	}
+
+	body := map[string]any{
+		"repo":       c.did,
+		"collection":  collection,
+		"rkey":        rkey,
+	}
+
+	bodyBytes, err := json.Marshal(body)
+	if err != nil {
+		return fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	url := pdsURL + "/xrpc/com.atproto.repo.deleteRecord"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+c.accessJWT)
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("PDS deleteRecord failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("PDS deleteRecord returned HTTP %d: %s", resp.StatusCode, respBody)
+	}
+	return nil
 }
 
 // buildRepoInfo creates a RepoInfo from a record map.
@@ -243,55 +411,12 @@ func buildRepoInfo(uri, cid string, m map[string]any, ownerDID, repoName string)
 	}
 }
 
-// resolveDID resolves a handle or DID to a DID.
-func (c *Client) resolveDID(ctx context.Context, owner string) (string, error) {
-	if strings.HasPrefix(owner, "did:") {
-		return owner, nil
-	}
-	if c.IsAuthenticated() {
-		resp, err := comatproto.IdentityResolveHandle(ctx, c.xrpc, owner)
-		if err != nil {
-			return "", fmt.Errorf("failed to resolve handle %q: %w", owner, err)
-		}
-		return resp.Did, nil
-	}
-	// Public resolution via PDS
-	return resolveHandlePublic(ctx, owner)
-}
-
-// ListMyRepos lists the authenticated user's Tangled repositories.
-func (c *Client) ListMyRepos(ctx context.Context) ([]*RepoInfo, error) {
-	if !c.IsAuthenticated() {
-		return nil, fmt.Errorf("authentication required")
-	}
-	records, err := comatproto.RepoListRecords(ctx, c.xrpc, CollectionRepo, "", 100, c.did, false)
-	if err != nil {
-		return nil, fmt.Errorf("failed to list repos: %w", err)
-	}
-
-	var repos []*RepoInfo
-	for _, rec := range records.Records {
-		m := recordToMap(rec)
-		name, _ := m["name"].(string)
-		knot, _ := m["knot"].(string)
-		if name == "" || knot == "" {
-			continue
-		}
-		repos = append(repos, buildRepoInfo(rec.Uri, rec.Cid, m, c.did, name))
-	}
-	return repos, nil
-}
-
 // discoverPDS resolves a handle to its PDS host by: handle → DID → PLC directory.
-// Falls back to DefaultPDS if any step fails.
 func discoverPDS(ctx context.Context, handle string) (string, error) {
-	// Step 1: Resolve handle to DID
 	did, err := resolveHandlePublic(ctx, handle)
 	if err != nil {
 		return DefaultPDS, fmt.Errorf("resolve handle: %w", err)
 	}
-
-	// Step 2: Look up PLC directory for PDS endpoint
 	pdsURL, err := resolvePDS(ctx, did)
 	if err != nil {
 		return DefaultPDS, fmt.Errorf("resolve PDS from DID: %w", err)
@@ -306,7 +431,7 @@ func resolveHandlePublic(ctx context.Context, handle string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -326,17 +451,29 @@ func resolveHandlePublic(ctx context.Context, handle string) (string, error) {
 
 // resolvePDS finds the PDS URL for a given DID by checking the PLC directory.
 func resolvePDS(ctx context.Context, did string) (string, error) {
-	if !strings.HasPrefix(did, "did:plc:") {
+	if !strings.HasPrefix(did, "did:plc:") && !strings.HasPrefix(did, "did:web:") {
 		return DefaultPDS, nil
 	}
 
+	if strings.HasPrefix(did, "did:web:") {
+		domain := strings.TrimPrefix(did, "did:web:")
+		url := "https://" + domain + "/.well-known/did.json"
+		return resolvePDSFromDIDDocument(ctx, url)
+	}
+
+	// did:plc — use PLC directory
 	url := "https://plc.directory/" + did
+	return resolvePDSFromDIDDocument(ctx, url)
+}
+
+// resolvePDSFromDIDDocument fetches a DID document and extracts the PDS service endpoint.
+func resolvePDSFromDIDDocument(ctx context.Context, url string) (string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return DefaultPDS, nil
 	}
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return DefaultPDS, nil
 	}
@@ -344,7 +481,7 @@ func resolvePDS(ctx context.Context, did string) (string, error) {
 
 	var doc struct {
 		Service []struct {
-			ID             string `json:"id"`
+			ID              string `json:"id"`
 			ServiceEndpoint string `json:"serviceEndpoint"`
 		} `json:"service"`
 	}
@@ -361,34 +498,12 @@ func resolvePDS(ctx context.Context, did string) (string, error) {
 	return DefaultPDS, nil
 }
 
-// recordToMap converts a RepoListRecords_Record's value to a map[string]any
-// by marshaling the LexiconTypeDecoder to JSON and unmarshaling.
-func recordToMap(rec *comatproto.RepoListRecords_Record) map[string]any {
-	if rec.Value == nil {
-		return nil
+// extractRkey extracts the record key from an AT-URI.
+// AT-URI format: at://did:plc:.../collection/rkey
+func extractRkey(uri string) (string, error) {
+	parts := strings.SplitN(uri, "/", 5)
+	if len(parts) < 5 {
+		return "", fmt.Errorf("invalid AT-URI: %q", uri)
 	}
-	b, err := rec.Value.MarshalJSON()
-	if err != nil {
-		return nil
-	}
-	var m map[string]any
-	if err := json.Unmarshal(b, &m); err != nil {
-		return nil
-	}
-	return m
-}
-
-// decodeRecordForWrite marshals a map to JSON and wraps it in a LexiconTypeDecoder
-// suitable for use with RepoPutRecord.
-func decodeRecordForWrite(record map[string]any) (*lexutil.LexiconTypeDecoder, error) {
-	recordBytes, err := json.Marshal(record)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal record: %w", err)
-	}
-
-	var decoded lexutil.LexiconTypeDecoder
-	if err := decoded.UnmarshalJSON(recordBytes); err != nil {
-		return nil, fmt.Errorf("failed to decode record: %w", err)
-	}
-	return &decoded, nil
+	return parts[4], nil
 }

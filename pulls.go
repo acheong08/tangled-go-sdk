@@ -2,20 +2,12 @@ package tangled
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
-	"strings"
-	"time"
-
-	comatproto "github.com/bluesky-social/indigo/api/atproto"
 )
 
 // ListPulls lists pull requests for the specified repository.
-// Note: Tangled stores PRs in the creator's PDS, so with an authenticated client
-// this only returns PRs that the authenticated user created. With a public client,
-// it queries the repo owner's PDS which may show a different set.
+// With an authenticated client, it queries the user's PDS for PRs they created.
+// With a public client, it falls back to ListPublicPulls (queries repo owner's PDS).
 func (c *Client) ListPulls(ctx context.Context, ownerSlashRepo string, limit int) ([]*Pull, error) {
 	repoInfo, err := c.ResolveRepo(ctx, ownerSlashRepo)
 	if err != nil {
@@ -26,49 +18,36 @@ func (c *Client) ListPulls(ctx context.Context, ownerSlashRepo string, limit int
 		limit = 50
 	}
 
-	records, err := comatproto.RepoListRecords(ctx, c.xrpc, CollectionPull, "", int64(limit), c.did, false)
+	if c.IsAuthenticated() {
+		return c.listPullsAuthenticated(ctx, repoInfo, limit)
+	}
+	return c.ListPublicPulls(ctx, ownerSlashRepo, limit)
+}
+
+func (c *Client) listPullsAuthenticated(ctx context.Context, repoInfo *RepoInfo, limit int) ([]*Pull, error) {
+	records, err := c.pdsListRecords(ctx, CollectionPull, limit)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list pulls: %w", err)
 	}
 
-	var pulls []*Pull
-	for _, rec := range records.Records {
-		m := recordToMap(rec)
+	repoRef := repoInfo.DID
+	if repoInfo.RepoDID != "" {
+		repoRef = repoInfo.RepoDID
+	}
 
-		// Check if this pull targets the requested repo
-		targetMap, _ := m["target"].(map[string]any)
+	var pulls []*Pull
+	for _, rec := range records {
+		targetMap, _ := rec.Value["target"].(map[string]any)
 		if targetMap == nil {
 			continue
 		}
 
 		targetRepo, _ := targetMap["repo"].(string)
-		// The target repo can be either the AT-URI or the owner's DID
-		// depending on the record format version
-		matchesRepo := targetRepo == repoInfo.ATURI || targetRepo == repoInfo.DID
-		if !matchesRepo {
+		if targetRepo != repoRef && targetRepo != repoInfo.ATURI {
 			continue
 		}
 
-		pull := &Pull{
-			URI:       rec.Uri,
-			CID:       rec.Cid,
-			Title:     jsonStr(m, "title"),
-			Body:      jsonStr(m, "body"),
-			CreatedAt: jsonStr(m, "createdAt"),
-		}
-
-		// Parse source
-		if sourceMap, ok := m["source"].(map[string]any); ok {
-			pull.Source.Branch, _ = sourceMap["branch"].(string)
-			pull.Source.SHA, _ = sourceMap["sha"].(string)
-			pull.Source.Repo, _ = sourceMap["repo"].(string)
-		}
-
-		// Parse target
-		pull.Target.Repo = targetRepo
-		pull.Target.Branch, _ = targetMap["branch"].(string)
-		pull.Target.RepoDID, _ = targetMap["repoDid"].(string)
-
+		pull := rawRecordToPull(rec)
 		pulls = append(pulls, pull)
 	}
 
@@ -76,15 +55,11 @@ func (c *Client) ListPulls(ctx context.Context, ownerSlashRepo string, limit int
 }
 
 // CreatePull creates a new pull request on the specified repository.
-// The source branch must already be pushed to the repo (or your fork).
-//
-// Note: Creating a PR on Tangled requires:
-//  1. The source branch to already exist on a knot
-//  2. The record to be written to the creator's PDS
-//
-// This method creates the PR record. The first round's patch must be provided
-// or the PR will be created with an empty rounds list (to be submitted later).
 func (c *Client) CreatePull(ctx context.Context, ownerSlashRepo string, params CreatePullParams) (*Pull, error) {
+	if err := c.requireAuth(); err != nil {
+		return nil, err
+	}
+
 	repoInfo, err := c.ResolveRepo(ctx, ownerSlashRepo)
 	if err != nil {
 		return nil, err
@@ -94,7 +69,7 @@ func (c *Client) CreatePull(ctx context.Context, ownerSlashRepo string, params C
 		params.TargetBranch = "main"
 	}
 
-	// Build the target object based on the newer repoDID format if available
+	// Use RepoDID for the target repo field (DID format per lexicon)
 	targetRepoRef := repoInfo.DID
 	if repoInfo.RepoDID != "" {
 		targetRepoRef = repoInfo.RepoDID
@@ -104,94 +79,60 @@ func (c *Client) CreatePull(ctx context.Context, ownerSlashRepo string, params C
 		"repo":   targetRepoRef,
 		"branch": params.TargetBranch,
 	}
-	if repoInfo.RepoDID != "" {
-		target["repoDid"] = repoInfo.RepoDID
-	}
 
 	source := map[string]any{
 		"branch": params.SourceBranch,
 	}
 
 	rkey := generateTID()
-	createdAt := time.Now().UTC().Format("2006-01-02T15:04:05Z")
+	createdAt := nowISO()
 
 	record := map[string]any{
 		"$type":     CollectionPull,
 		"title":     params.Title,
 		"target":    target,
 		"source":    source,
-		"rounds":    []any{}, // Empty rounds; patch can be submitted later
+		"rounds":    []any{},
 		"createdAt": createdAt,
 	}
 	if params.Body != "" {
 		record["body"] = params.Body
 	}
 
-	decoded, err := decodeRecordForWrite(record)
-	if err != nil {
-		return nil, err
-	}
-
-	out, err := comatproto.RepoPutRecord(ctx, c.xrpc, &comatproto.RepoPutRecord_Input{
-		Collection: CollectionPull,
-		Repo:       c.did,
-		Rkey:       rkey,
-		Record:     decoded,
-	})
+	uri, cid, err := c.pdsPutRecord(ctx, CollectionPull, rkey, record, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create pull request: %w", err)
 	}
 
-	pull := &Pull{
-		URI:       out.Uri,
-		CID:       out.Cid,
+	return &Pull{
+		URI:       uri,
+		CID:       cid,
 		Title:     params.Title,
 		Body:      params.Body,
 		Source:    PullSource{Branch: params.SourceBranch},
-		Target:    PullTarget{Repo: targetRepoRef, Branch: params.TargetBranch, RepoDID: repoInfo.RepoDID},
+		Target:    PullTarget{Repo: targetRepoRef, Branch: params.TargetBranch},
 		CreatedAt: createdAt,
-	}
-
-	return pull, nil
+	}, nil
 }
 
 // GetPull retrieves a specific pull request by its AT-URI rkey.
 func (c *Client) GetPull(ctx context.Context, rkey string) (*Pull, error) {
-	if !c.IsAuthenticated() {
-		return nil, fmt.Errorf("authentication required for GetPull")
+	if err := c.requireAuth(); err != nil {
+		return nil, err
 	}
-	records, err := comatproto.RepoListRecords(ctx, c.xrpc, CollectionPull, "", 100, c.did, false)
+
+	records, err := c.pdsListRecords(ctx, CollectionPull, 100)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list pulls: %w", err)
 	}
 
-	for _, rec := range records.Records {
-		// Check if this record matches the requested rkey
-		parts := strings.Split(rec.Uri, "/")
-		if parts[len(parts)-1] != rkey {
+	for _, rec := range records {
+		recRkey, err := extractRkey(rec.URI)
+		if err != nil || recRkey != rkey {
 			continue
 		}
 
-		m := recordToMap(rec)
-		pull := &Pull{
-			URI:       rec.Uri,
-			CID:       rec.Cid,
-			Title:     jsonStr(m, "title"),
-			Body:      jsonStr(m, "body"),
-			CreatedAt: jsonStr(m, "createdAt"),
-		}
-
-		if sourceMap, ok := m["source"].(map[string]any); ok {
-			pull.Source.Branch, _ = sourceMap["branch"].(string)
-			pull.Source.SHA, _ = sourceMap["sha"].(string)
-		}
-
-		if targetMap, ok := m["target"].(map[string]any); ok {
-			pull.Target.Repo, _ = targetMap["repo"].(string)
-			pull.Target.Branch, _ = targetMap["branch"].(string)
-			pull.Target.RepoDID, _ = targetMap["repoDid"].(string)
-		}
-
+		pull := rawRecordToPull(rec)
 		return pull, nil
 	}
 
@@ -199,7 +140,6 @@ func (c *Client) GetPull(ctx context.Context, rkey string) (*Pull, error) {
 }
 
 // ListPublicPulls lists pull requests on a repository using public PDS queries.
-// This queries the repo owner's PDS for PR records that target this repo.
 func (c *Client) ListPublicPulls(ctx context.Context, ownerSlashRepo string, limit int) ([]*Pull, error) {
 	repoInfo, err := c.ResolveRepo(ctx, ownerSlashRepo)
 	if err != nil {
@@ -215,75 +155,65 @@ func (c *Client) ListPublicPulls(ctx context.Context, ownerSlashRepo string, lim
 		return nil, err
 	}
 
-	url := fmt.Sprintf("%s/xrpc/com.atproto.repo.listRecords?repo=%s&collection=%s&limit=%d",
-		pdsURL, repoInfo.DID, CollectionPull, limit)
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return nil, err
+	var records []pdsRecord
+	if c.IsAuthenticated() {
+		// Authenticated: query owner's PDS with our token
+		records, err = pdsListRecords(ctx, pdsURL, repoInfo.DID, CollectionPull, limit, c.accessJWT)
+	} else {
+		records, err = pdsListRecords(ctx, pdsURL, repoInfo.DID, CollectionPull, limit, "")
 	}
-
-	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query PDS: %w", err)
 	}
-	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("PDS returned HTTP %d: %s", resp.StatusCode, body)
-	}
-
-	var result struct {
-		Records []struct {
-			URI   string         `json:"uri"`
-			CID   string         `json:"cid"`
-			Value map[string]any `json:"value"`
-		} `json:"records"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, fmt.Errorf("failed to decode response: %w", err)
+	repoRef := repoInfo.DID
+	if repoInfo.RepoDID != "" {
+		repoRef = repoInfo.RepoDID
 	}
 
 	var pulls []*Pull
-	for _, rec := range result.Records {
+	for _, rec := range records {
 		targetMap, _ := rec.Value["target"].(map[string]any)
 		if targetMap == nil {
 			continue
 		}
 
 		targetRepo, _ := targetMap["repo"].(string)
-		if targetRepo != repoInfo.DID && targetRepo != repoInfo.ATURI {
+		if targetRepo != repoRef && targetRepo != repoInfo.ATURI {
 			continue
 		}
 
-		pull := &Pull{
-			URI:       rec.URI,
-			CID:       rec.CID,
-			Title:     jsonStrFromMap(rec.Value, "title"),
-			Body:      jsonStrFromMap(rec.Value, "body"),
-			CreatedAt: jsonStrFromMap(rec.Value, "createdAt"),
-		}
-
-		if sourceMap, ok := rec.Value["source"].(map[string]any); ok {
-			pull.Source.Branch, _ = sourceMap["branch"].(string)
-			pull.Source.SHA, _ = sourceMap["sha"].(string)
-			pull.Source.Repo, _ = sourceMap["repo"].(string)
-		}
-
-		pull.Target.Repo = targetRepo
-		pull.Target.Branch, _ = targetMap["branch"].(string)
-		pull.Target.RepoDID, _ = targetMap["repoDid"].(string)
-
+		pull := rawRecordToPull(rec)
 		pulls = append(pulls, pull)
 	}
 
 	return pulls, nil
 }
 
-// jsonStrFromMap extracts a string field from a map[string]any (different from the
-// jsonStr helper in json_helpers.go which works with map[string]any from indigo records).
-func jsonStrFromMap(m map[string]any, key string) string {
-	v, _ := m[key].(string)
-	return v
+// rawRecordToPull converts a raw pdsRecord to a Pull.
+func rawRecordToPull(rec pdsRecord) *Pull {
+	pull := &Pull{
+		URI:       rec.URI,
+		CID:       rec.CID,
+		Title:     jsonStr(rec.Value, "title"),
+		Body:      jsonStr(rec.Value, "body"),
+		CreatedAt: jsonStr(rec.Value, "createdAt"),
+	}
+
+	if sourceMap, ok := rec.Value["source"].(map[string]any); ok {
+		pull.Source.Branch, _ = sourceMap["branch"].(string)
+		pull.Source.SHA, _ = sourceMap["sha"].(string)
+		pull.Source.Repo, _ = sourceMap["repo"].(string)
+	}
+
+	if targetMap, ok := rec.Value["target"].(map[string]any); ok {
+		pull.Target.Repo, _ = targetMap["repo"].(string)
+		pull.Target.Branch, _ = targetMap["branch"].(string)
+		// repoDid is a non-standard extension in target; read it if present
+		if rd, ok := targetMap["repoDid"].(string); ok {
+			pull.Target.RepoDID = rd
+		}
+	}
+
+	return pull
 }

@@ -45,7 +45,7 @@ func (c *Client) ListBranches(ctx context.Context, ownerSlashRepo string, limit 
 	q.Set("limit", strconv.Itoa(limit))
 	req.URL.RawQuery = q.Encode()
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list branches: %w", err)
 	}

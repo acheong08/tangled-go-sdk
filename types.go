@@ -103,17 +103,21 @@ type CreateIssueParams struct {
 }
 
 // UpdateIssueParams contains the parameters for updating an issue.
+// Use *string fields to distinguish "don't change" (nil) from "set to empty" (pointer to "").
 type UpdateIssueParams struct {
 	// IssueID is the sequential issue number to update (required).
 	IssueID int
-	// Title is the new title (if set, replaces existing).
-	Title string
-	// Body is the new body (if set, replaces existing).
-	Body string
+	// Title is the new title. nil means don't change; pointer to "" means clear.
+	Title *string
+	// Body is the new body. nil means don't change; pointer to "" means clear.
+	Body *string
 	// Labels replaces all existing labels. Use empty slice to clear all labels.
 	// Nil means don't change labels.
 	Labels []string
 }
+
+// StringPtr is a helper to create a *string from a string literal.
+func StringPtr(s string) *string { return &s }
 
 // CreatePullParams contains the parameters for creating a pull request.
 type CreatePullParams struct {

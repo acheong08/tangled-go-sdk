@@ -47,7 +47,7 @@ func TestAuthenticatedCreateIssue(t *testing.T) {
 	// Update the issue
 	updated, err := client.UpdateIssue(ctx, repoID, UpdateIssueParams{
 		IssueID: created.ID,
-		Title:   "Updated test issue from Go client",
+		Title:   StringPtr("Updated test issue from Go client"),
 	})
 	if err != nil {
 		t.Fatalf("failed to update issue: %v", err)

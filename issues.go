@@ -2,44 +2,46 @@ package tangled
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
 	"strconv"
 	"strings"
 	"time"
-
-	comatproto "github.com/bluesky-social/indigo/api/atproto"
 )
 
 // CreateIssue creates a new issue on the specified repository.
 func (c *Client) CreateIssue(ctx context.Context, ownerSlashRepo string, params CreateIssueParams) (*Issue, error) {
+	if err := c.requireAuth(); err != nil {
+		return nil, err
+	}
+
 	repoInfo, err := c.ResolveRepo(ctx, ownerSlashRepo)
 	if err != nil {
 		return nil, err
 	}
 
-	// Find the next sequential issue ID
-	nextID, err := c.nextIssueID(ctx, repoInfo.ATURI)
+	nextID, err := c.nextIssueID(ctx, repoInfo)
 	if err != nil {
 		return nil, fmt.Errorf("failed to determine next issue ID: %w", err)
 	}
 
-	// Validate labels if provided
 	if len(params.Labels) > 0 {
 		if err := c.validateLabels(params.Labels, repoInfo.Labels); err != nil {
 			return nil, err
 		}
 	}
 
-	// Create the issue record
 	rkey := strconv.FormatInt(time.Now().UnixMicro(), 10)
-	createdAt := time.Now().UTC().Format("2006-01-02T15:04:05Z")
+	createdAt := nowISO()
+
+	// Use RepoDID (stable repo identity) for the repo field, falling back to owner DID
+	repoRef := repoInfo.DID
+	if repoInfo.RepoDID != "" {
+		repoRef = repoInfo.RepoDID
+	}
 
 	record := map[string]any{
 		"$type":     CollectionIssue,
-		"repo":       repoInfo.ATURI,
+		"repo":      repoRef,
 		"issueId":   nextID,
 		"owner":     c.did,
 		"title":     params.Title,
@@ -49,33 +51,22 @@ func (c *Client) CreateIssue(ctx context.Context, ownerSlashRepo string, params 
 		record["body"] = params.Body
 	}
 
-	decoded, err := decodeRecordForWrite(record)
-	if err != nil {
-		return nil, err
-	}
-
-	out, err := comatproto.RepoPutRecord(ctx, c.xrpc, &comatproto.RepoPutRecord_Input{
-		Collection: CollectionIssue,
-		Repo:       c.did,
-		Rkey:       rkey,
-		Record:     decoded,
-	})
+	uri, cid, err := c.pdsPutRecord(ctx, CollectionIssue, rkey, record, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create issue: %w", err)
 	}
 
 	// Apply labels if specified
 	if len(params.Labels) > 0 {
-		currentLabels := []string{}
-		if err := c.applyLabels(ctx, out.Uri, params.Labels, repoInfo.Labels, currentLabels); err != nil {
-			// Issue was created but labels failed; report in logs but don't fail
+		if err := c.applyLabels(ctx, uri, params.Labels, repoInfo.Labels, nil); err != nil {
+			// Issue was created but labels failed
 			_ = err
 		}
 	}
 
 	return &Issue{
-		URI:       out.Uri,
-		CID:       out.Cid,
+		URI:       uri,
+		CID:       cid,
 		ID:        nextID,
 		Title:     params.Title,
 		Body:      params.Body,
@@ -87,28 +78,36 @@ func (c *Client) CreateIssue(ctx context.Context, ownerSlashRepo string, params 
 
 // GetIssue retrieves a specific issue by its sequential ID.
 func (c *Client) GetIssue(ctx context.Context, ownerSlashRepo string, issueID int) (*Issue, error) {
+	if err := c.requireAuth(); err != nil {
+		return nil, err
+	}
+
 	repoInfo, err := c.ResolveRepo(ctx, ownerSlashRepo)
 	if err != nil {
 		return nil, err
 	}
 
-	records, err := comatproto.RepoListRecords(ctx, c.xrpc, CollectionIssue, "", 100, c.did, false)
+	records, err := c.pdsListRecords(ctx, CollectionIssue, 100)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list issues: %w", err)
 	}
 
-	for _, rec := range records.Records {
-		m := recordToMap(rec)
-		repo, _ := m["repo"].(string)
-		if repo != repoInfo.ATURI {
+	repoRef := repoInfo.DID
+	if repoInfo.RepoDID != "" {
+		repoRef = repoInfo.RepoDID
+	}
+
+	for _, rec := range records {
+		repo, _ := rec.Value["repo"].(string)
+		if repo != repoRef && repo != repoInfo.ATURI {
 			continue
 		}
-		id := int(jsonFloat(m, "issueId"))
+		id := int(jsonFloat(rec.Value, "issueId"))
 		if id != issueID {
 			continue
 		}
 
-		issue := recordToIssue(rec, m)
+		issue := rawRecordToIssue(rec)
 		issue.Labels, _ = c.getIssueLabels(ctx, issue.URI)
 		return issue, nil
 	}
@@ -117,8 +116,8 @@ func (c *Client) GetIssue(ctx context.Context, ownerSlashRepo string, issueID in
 }
 
 // ListIssues lists issues for the specified repository.
-// With an authenticated client, it queries the user's PDS via xrpc.
-// With a public client, it falls back to direct PDS queries.
+// With an authenticated client, it queries the user's PDS.
+// With a public client, it falls back to direct PDS queries against the repo owner.
 func (c *Client) ListIssues(ctx context.Context, ownerSlashRepo string, limit int) ([]*Issue, error) {
 	repoInfo, err := c.ResolveRepo(ctx, ownerSlashRepo)
 	if err != nil {
@@ -135,33 +134,35 @@ func (c *Client) ListIssues(ctx context.Context, ownerSlashRepo string, limit in
 	return c.listIssuesPublic(ctx, repoInfo, limit)
 }
 
-// listIssuesAuthenticated lists issues using the authenticated xrpc client.
 func (c *Client) listIssuesAuthenticated(ctx context.Context, repoInfo *RepoInfo, limit int) ([]*Issue, error) {
-	records, err := comatproto.RepoListRecords(ctx, c.xrpc, CollectionIssue, "", int64(limit), c.did, false)
+	records, err := c.pdsListRecords(ctx, CollectionIssue, limit)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list issues: %w", err)
 	}
 
+	repoRef := repoInfo.DID
+	if repoInfo.RepoDID != "" {
+		repoRef = repoInfo.RepoDID
+	}
+
 	var issues []*Issue
-	var issueURIs []string
-	for _, rec := range records.Records {
-		m := recordToMap(rec)
-		repo, _ := m["repo"].(string)
-		if repo != repoInfo.ATURI {
+	for _, rec := range records {
+		repo, _ := rec.Value["repo"].(string)
+		if repo != repoRef && repo != repoInfo.ATURI {
 			continue
 		}
-
-		id := int(jsonFloat(m, "issueId"))
+		id := int(jsonFloat(rec.Value, "issueId"))
 		if id == 0 {
 			continue
 		}
-
-		issue := recordToIssue(rec, m)
-		issues = append(issues, issue)
-		issueURIs = append(issueURIs, issue.URI)
+		issues = append(issues, rawRecordToIssue(rec))
 	}
 
-	// Fetch labels for all issues in one pass
+	// Fetch labels in one pass
+	issueURIs := make([]string, len(issues))
+	for i, issue := range issues {
+		issueURIs[i] = issue.URI
+	}
 	if len(issueURIs) > 0 {
 		labelsMap, _ := c.getLabelsForIssues(ctx, issueURIs)
 		for _, issue := range issues {
@@ -174,164 +175,119 @@ func (c *Client) listIssuesAuthenticated(ctx context.Context, repoInfo *RepoInfo
 	return issues, nil
 }
 
-// listIssuesPublic lists issues using public PDS HTTP endpoints.
 func (c *Client) listIssuesPublic(ctx context.Context, repoInfo *RepoInfo, limit int) ([]*Issue, error) {
-	// Issues are stored on the creator's PDS, not the repo owner's PDS.
-	// For the public path, we query the repo owner's PDS for issues
-	// that reference this repo.
 	pdsURL, err := resolvePDS(ctx, repoInfo.DID)
 	if err != nil {
 		return nil, err
 	}
 
-	url := fmt.Sprintf("%s/xrpc/com.atproto.repo.listRecords?repo=%s&collection=%s&limit=%d",
-		pdsURL, repoInfo.DID, CollectionIssue, limit)
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	records, err := pdsListRecords(ctx, pdsURL, repoInfo.DID, CollectionIssue, limit, "")
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to list issues: %w", err)
 	}
 
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to query PDS: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("PDS returned HTTP %d: %s", resp.StatusCode, body)
-	}
-
-	var result struct {
-		Records []struct {
-			URI   string         `json:"uri"`
-			CID   string         `json:"cid"`
-			Value map[string]any `json:"value"`
-		} `json:"records"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, fmt.Errorf("failed to decode response: %w", err)
+	repoRef := repoInfo.DID
+	if repoInfo.RepoDID != "" {
+		repoRef = repoInfo.RepoDID
 	}
 
 	var issues []*Issue
-	for _, rec := range result.Records {
+	for _, rec := range records {
 		repo, _ := rec.Value["repo"].(string)
-		// Filter by repo AT-URI or owner DID
-		if repo != repoInfo.ATURI && repo != repoInfo.DID {
+		if repo != repoRef && repo != repoInfo.ATURI {
 			continue
 		}
-
-		id := 0
-		if f, ok := rec.Value["issueId"].(float64); ok {
-			id = int(f)
-		}
+		id := int(jsonFloat(rec.Value, "issueId"))
 		if id == 0 {
 			continue
 		}
-
-		title, _ := rec.Value["title"].(string)
-		body, _ := rec.Value["body"].(string)
-		owner, _ := rec.Value["owner"].(string)
-		createdAt, _ := rec.Value["createdAt"].(string)
-
-		issues = append(issues, &Issue{
-			URI:       rec.URI,
-			CID:       rec.CID,
-			ID:        id,
-			Title:     title,
-			Body:      body,
-			Owner:     owner,
-			CreatedAt: createdAt,
-		})
+		issues = append(issues, rawRecordToIssue(rec))
 	}
-
 	return issues, nil
 }
 
 // UpdateIssue updates an existing issue on the specified repository.
 func (c *Client) UpdateIssue(ctx context.Context, ownerSlashRepo string, params UpdateIssueParams) (*Issue, error) {
+	if err := c.requireAuth(); err != nil {
+		return nil, err
+	}
+
 	repoInfo, err := c.ResolveRepo(ctx, ownerSlashRepo)
 	if err != nil {
 		return nil, err
 	}
 
-	// Find the existing issue record
-	records, err := comatproto.RepoListRecords(ctx, c.xrpc, CollectionIssue, "", 100, c.did, false)
+	records, err := c.pdsListRecords(ctx, CollectionIssue, 100)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list issues: %w", err)
 	}
 
+	repoRef := repoInfo.DID
+	if repoInfo.RepoDID != "" {
+		repoRef = repoInfo.RepoDID
+	}
+
 	var (
-		existingRec  *comatproto.RepoListRecords_Record
 		existingMap  map[string]any
+		existingCID  string
 		existingRkey string
 	)
-	for _, rec := range records.Records {
-		m := recordToMap(rec)
-		repo, _ := m["repo"].(string)
-		if repo != repoInfo.ATURI {
+	for _, rec := range records {
+		repo, _ := rec.Value["repo"].(string)
+		if repo != repoRef && repo != repoInfo.ATURI {
 			continue
 		}
-		id := int(jsonFloat(m, "issueId"))
+		id := int(jsonFloat(rec.Value, "issueId"))
 		if id != params.IssueID {
 			continue
 		}
-		existingRec = rec
-		existingMap = m
-		parts := strings.Split(rec.Uri, "/")
-		existingRkey = parts[len(parts)-1]
+		existingMap = rec.Value
+		existingCID = rec.CID
+		existingRkey, err = extractRkey(rec.URI)
+		if err != nil {
+			return nil, err
+		}
 		break
 	}
 
-	if existingRec == nil {
+	if existingMap == nil {
 		return nil, fmt.Errorf("issue #%d not found in repo %s", params.IssueID, ownerSlashRepo)
 	}
 
-	// Build updated record, preserving existing values where not specified
-	title := params.Title
-	if title == "" {
-		title, _ = existingMap["title"].(string)
+	// Build updated record — *string nil means don't change, pointer to "" means clear
+	title := jsonStr(existingMap, "title")
+	if params.Title != nil {
+		title = *params.Title
 	}
-	body := params.Body
-	if body == "" {
-		body, _ = existingMap["body"].(string)
+	body := jsonStr(existingMap, "body")
+	if params.Body != nil {
+		body = *params.Body
 	}
-	owner, _ := existingMap["owner"].(string)
-	createdAt, _ := existingMap["createdAt"].(string)
+	owner := jsonStr(existingMap, "owner")
+	createdAt := jsonStr(existingMap, "createdAt")
+	repo := jsonStr(existingMap, "repo")
 
 	updatedRecord := map[string]any{
 		"$type":     CollectionIssue,
-		"repo":      repoInfo.ATURI,
+		"repo":      repo,
 		"issueId":   params.IssueID,
 		"owner":     owner,
 		"title":     title,
 		"createdAt": createdAt,
 	}
-	if body != "" {
+	// Always include body when explicitly set (even if empty), skip if unchanged
+	if params.Body != nil || body != "" {
 		updatedRecord["body"] = body
 	}
 
-	decoded, err := decodeRecordForWrite(updatedRecord)
-	if err != nil {
-		return nil, err
-	}
-
-	swapRecord := existingRec.Cid
-	out, err := comatproto.RepoPutRecord(ctx, c.xrpc, &comatproto.RepoPutRecord_Input{
-		Collection: CollectionIssue,
-		Repo:       c.did,
-		Rkey:       existingRkey,
-		Record:     decoded,
-		SwapRecord: &swapRecord,
-	})
+	uri, cid, err := c.pdsPutRecord(ctx, CollectionIssue, existingRkey, updatedRecord, &existingCID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to update issue: %w", err)
 	}
 
 	result := &Issue{
-		URI:       out.Uri,
-		CID:       out.Cid,
+		URI:       uri,
+		CID:       cid,
 		ID:        params.IssueID,
 		Title:     title,
 		Body:      body,
@@ -339,18 +295,17 @@ func (c *Client) UpdateIssue(ctx context.Context, ownerSlashRepo string, params 
 		CreatedAt: createdAt,
 	}
 
-	// Handle label updates if specified
 	if params.Labels != nil {
 		if err := c.validateLabels(params.Labels, repoInfo.Labels); err != nil {
 			return nil, err
 		}
-		currentLabels, _ := c.getIssueLabels(ctx, out.Uri)
-		if err := c.applyLabels(ctx, out.Uri, params.Labels, repoInfo.Labels, currentLabels); err != nil {
+		currentLabels, _ := c.getIssueLabels(ctx, uri)
+		if err := c.applyLabels(ctx, uri, params.Labels, repoInfo.Labels, currentLabels); err != nil {
 			return nil, fmt.Errorf("failed to apply labels: %w", err)
 		}
 		result.Labels = params.Labels
 	} else {
-		result.Labels, _ = c.getIssueLabels(ctx, out.Uri)
+		result.Labels, _ = c.getIssueLabels(ctx, uri)
 	}
 
 	return result, nil
@@ -358,36 +313,41 @@ func (c *Client) UpdateIssue(ctx context.Context, ownerSlashRepo string, params 
 
 // DeleteIssue deletes an issue from the specified repository.
 func (c *Client) DeleteIssue(ctx context.Context, ownerSlashRepo string, issueID int) error {
+	if err := c.requireAuth(); err != nil {
+		return err
+	}
+
 	repoInfo, err := c.ResolveRepo(ctx, ownerSlashRepo)
 	if err != nil {
 		return err
 	}
 
-	records, err := comatproto.RepoListRecords(ctx, c.xrpc, CollectionIssue, "", 100, c.did, false)
+	records, err := c.pdsListRecords(ctx, CollectionIssue, 100)
 	if err != nil {
 		return fmt.Errorf("failed to list issues: %w", err)
 	}
 
-	for _, rec := range records.Records {
-		m := recordToMap(rec)
-		repo, _ := m["repo"].(string)
-		if repo != repoInfo.ATURI {
+	repoRef := repoInfo.DID
+	if repoInfo.RepoDID != "" {
+		repoRef = repoInfo.RepoDID
+	}
+
+	for _, rec := range records {
+		repo, _ := rec.Value["repo"].(string)
+		if repo != repoRef && repo != repoInfo.ATURI {
 			continue
 		}
-		id := int(jsonFloat(m, "issueId"))
+		id := int(jsonFloat(rec.Value, "issueId"))
 		if id != issueID {
 			continue
 		}
 
-		parts := strings.Split(rec.Uri, "/")
-		rkey := parts[len(parts)-1]
-
-		_, err := comatproto.RepoDeleteRecord(ctx, c.xrpc, &comatproto.RepoDeleteRecord_Input{
-			Collection: CollectionIssue,
-			Repo:       c.did,
-			Rkey:       rkey,
-		})
+		rkey, err := extractRkey(rec.URI)
 		if err != nil {
+			return err
+		}
+
+		if err := c.pdsDeleteRecord(ctx, CollectionIssue, rkey); err != nil {
 			return fmt.Errorf("failed to delete issue #%d: %w", issueID, err)
 		}
 		return nil
@@ -411,34 +371,38 @@ func (c *Client) ListLabels(ctx context.Context, ownerSlashRepo string) ([]strin
 	return labels, nil
 }
 
-// recordToIssue converts a list record to an Issue struct.
-func recordToIssue(rec *comatproto.RepoListRecords_Record, m map[string]any) *Issue {
+// rawRecordToIssue converts a raw pdsRecord to an Issue.
+func rawRecordToIssue(rec pdsRecord) *Issue {
 	return &Issue{
-		URI:       rec.Uri,
-		CID:       rec.Cid,
-		ID:        int(jsonFloat(m, "issueId")),
-		Title:     jsonStr(m, "title"),
-		Body:      jsonStr(m, "body"),
-		Owner:     jsonStr(m, "owner"),
-		CreatedAt: jsonStr(m, "createdAt"),
+		URI:       rec.URI,
+		CID:       rec.CID,
+		ID:        int(jsonFloat(rec.Value, "issueId")),
+		Title:     jsonStr(rec.Value, "title"),
+		Body:      jsonStr(rec.Value, "body"),
+		Owner:     jsonStr(rec.Value, "owner"),
+		CreatedAt: jsonStr(rec.Value, "createdAt"),
 	}
 }
 
 // nextIssueID determines the next sequential issue ID for a repo.
-func (c *Client) nextIssueID(ctx context.Context, repoATURI string) (int, error) {
-	records, err := comatproto.RepoListRecords(ctx, c.xrpc, CollectionIssue, "", 100, c.did, false)
+func (c *Client) nextIssueID(ctx context.Context, repoInfo *RepoInfo) (int, error) {
+	records, err := c.pdsListRecords(ctx, CollectionIssue, 100)
 	if err != nil {
-		return 1, nil // No existing issues, start at 1
+		return 0, fmt.Errorf("failed to list existing issues: %w", err)
+	}
+
+	repoRef := repoInfo.DID
+	if repoInfo.RepoDID != "" {
+		repoRef = repoInfo.RepoDID
 	}
 
 	maxID := 0
-	for _, rec := range records.Records {
-		m := recordToMap(rec)
-		repo, _ := m["repo"].(string)
-		if repo != repoATURI {
+	for _, rec := range records {
+		repo, _ := rec.Value["repo"].(string)
+		if repo != repoRef && repo != repoInfo.ATURI {
 			continue
 		}
-		id := int(jsonFloat(m, "issueId"))
+		id := int(jsonFloat(rec.Value, "issueId"))
 		if id > maxID {
 			maxID = id
 		}
@@ -447,7 +411,6 @@ func (c *Client) nextIssueID(ctx context.Context, repoATURI string) (int, error)
 	return maxID + 1, nil
 }
 
-// validateLabels checks that all requested labels exist in the repo's subscribed labels.
 func (c *Client) validateLabels(labels []string, repoLabelURIs []string) error {
 	availableNames := make([]string, 0, len(repoLabelURIs))
 	for _, uri := range repoLabelURIs {
@@ -488,9 +451,7 @@ func (c *Client) validateLabels(labels []string, repoLabelURIs []string) error {
 	return nil
 }
 
-// applyLabels creates a label op record to apply labels to an issue.
 func (c *Client) applyLabels(ctx context.Context, issueURI string, labels []string, repoLabelURIs []string, currentLabels []string) error {
-	// Resolve label names to URIs
 	newLabelURIs := make(map[string]bool)
 	for _, label := range labels {
 		if strings.HasPrefix(label, "at://") {
@@ -512,7 +473,6 @@ func (c *Client) applyLabels(ctx context.Context, issueURI string, labels []stri
 		currentSet[l] = true
 	}
 
-	// Calculate diff
 	var toAdd, toDelete []map[string]string
 	for uri := range newLabelURIs {
 		if !currentSet[uri] {
@@ -535,44 +495,29 @@ func (c *Client) applyLabels(ctx context.Context, issueURI string, labels []stri
 		"subject":    issueURI,
 		"add":         toAdd,
 		"delete":      toDelete,
-		"performedAt": time.Now().UTC().Format("2006-01-02T15:04:05Z"),
+		"performedAt": nowISO(),
 	}
 
-	decoded, err := decodeRecordForWrite(record)
-	if err != nil {
-		return err
-	}
-
-	_, err = comatproto.RepoPutRecord(ctx, c.xrpc, &comatproto.RepoPutRecord_Input{
-		Collection: CollectionLabelOp,
-		Repo:       c.did,
-		Rkey:       rkey,
-		Record:     decoded,
-	})
+	_, _, err := c.pdsPutRecord(ctx, CollectionLabelOp, rkey, record, nil)
 	if err != nil {
 		return fmt.Errorf("failed to create label op: %w", err)
 	}
-
 	return nil
 }
 
-// getIssueLabels retrieves the current labels for an issue.
 func (c *Client) getIssueLabels(ctx context.Context, issueURI string) ([]string, error) {
-	records, err := comatproto.RepoListRecords(ctx, c.xrpc, CollectionLabelOp, "", 100, c.did, false)
+	records, err := c.pdsListRecords(ctx, CollectionLabelOp, 100)
 	if err != nil {
 		return nil, err
 	}
 
 	labelSet := make(map[string]bool)
-	for _, rec := range records.Records {
-		m := recordToMap(rec)
-		subject, _ := m["subject"].(string)
+	for _, rec := range records {
+		subject := jsonStr(rec.Value, "subject")
 		if subject != issueURI {
 			continue
 		}
-
-		// Process "add" operations
-		if addItems, ok := m["add"].([]any); ok {
+		if addItems, ok := rec.Value["add"].([]any); ok {
 			for _, item := range addItems {
 				if sm, ok := item.(map[string]any); ok {
 					if key, ok := sm["key"].(string); ok {
@@ -581,9 +526,7 @@ func (c *Client) getIssueLabels(ctx context.Context, issueURI string) ([]string,
 				}
 			}
 		}
-
-		// Process "delete" operations
-		if deleteItems, ok := m["delete"].([]any); ok {
+		if deleteItems, ok := rec.Value["delete"].([]any); ok {
 			for _, item := range deleteItems {
 				if sm, ok := item.(map[string]any); ok {
 					if key, ok := sm["key"].(string); ok {
@@ -596,16 +539,14 @@ func (c *Client) getIssueLabels(ctx context.Context, issueURI string) ([]string,
 
 	labels := make([]string, 0, len(labelSet))
 	for k := range labelSet {
-		// Extract label name from URI
 		parts := strings.Split(k, "/")
 		labels = append(labels, parts[len(parts)-1])
 	}
 	return labels, nil
 }
 
-// getLabelsForIssues fetches labels for multiple issues at once.
 func (c *Client) getLabelsForIssues(ctx context.Context, issueURIs []string) (map[string][]string, error) {
-	records, err := comatproto.RepoListRecords(ctx, c.xrpc, CollectionLabelOp, "", 100, c.did, false)
+	records, err := c.pdsListRecords(ctx, CollectionLabelOp, 100)
 	if err != nil {
 		return nil, err
 	}
@@ -620,14 +561,12 @@ func (c *Client) getLabelsForIssues(ctx context.Context, issueURIs []string) (ma
 		result[u] = make(map[string]bool)
 	}
 
-	for _, rec := range records.Records {
-		m := recordToMap(rec)
-		subject, _ := m["subject"].(string)
+	for _, rec := range records {
+		subject := jsonStr(rec.Value, "subject")
 		if !uriSet[subject] {
 			continue
 		}
-
-		if addItems, ok := m["add"].([]any); ok {
+		if addItems, ok := rec.Value["add"].([]any); ok {
 			for _, item := range addItems {
 				if sm, ok := item.(map[string]any); ok {
 					if key, ok := sm["key"].(string); ok {
@@ -636,8 +575,7 @@ func (c *Client) getLabelsForIssues(ctx context.Context, issueURIs []string) (ma
 				}
 			}
 		}
-
-		if deleteItems, ok := m["delete"].([]any); ok {
+		if deleteItems, ok := rec.Value["delete"].([]any); ok {
 			for _, item := range deleteItems {
 				if sm, ok := item.(map[string]any); ok {
 					if key, ok := sm["key"].(string); ok {
