@@ -2,16 +2,20 @@ package tangled
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"strings"
 	"time"
 
 	comatproto "github.com/bluesky-social/indigo/api/atproto"
 )
 
-// ListPulls lists pull requests created by the authenticated user for the
-// specified repository. Note: Tangled stores PRs in the creator's PDS, so
-// this only returns PRs that the authenticated user created.
+// ListPulls lists pull requests for the specified repository.
+// Note: Tangled stores PRs in the creator's PDS, so with an authenticated client
+// this only returns PRs that the authenticated user created. With a public client,
+// it queries the repo owner's PDS which may show a different set.
 func (c *Client) ListPulls(ctx context.Context, ownerSlashRepo string, limit int) ([]*Pull, error) {
 	repoInfo, err := c.ResolveRepo(ctx, ownerSlashRepo)
 	if err != nil {
@@ -153,6 +157,9 @@ func (c *Client) CreatePull(ctx context.Context, ownerSlashRepo string, params C
 
 // GetPull retrieves a specific pull request by its AT-URI rkey.
 func (c *Client) GetPull(ctx context.Context, rkey string) (*Pull, error) {
+	if !c.IsAuthenticated() {
+		return nil, fmt.Errorf("authentication required for GetPull")
+	}
 	records, err := comatproto.RepoListRecords(ctx, c.xrpc, CollectionPull, "", 100, c.did, false)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list pulls: %w", err)
@@ -189,4 +196,94 @@ func (c *Client) GetPull(ctx context.Context, rkey string) (*Pull, error) {
 	}
 
 	return nil, fmt.Errorf("pull request with rkey %q not found", rkey)
+}
+
+// ListPublicPulls lists pull requests on a repository using public PDS queries.
+// This queries the repo owner's PDS for PR records that target this repo.
+func (c *Client) ListPublicPulls(ctx context.Context, ownerSlashRepo string, limit int) ([]*Pull, error) {
+	repoInfo, err := c.ResolveRepo(ctx, ownerSlashRepo)
+	if err != nil {
+		return nil, err
+	}
+
+	if limit <= 0 || limit > 100 {
+		limit = 50
+	}
+
+	pdsURL, err := resolvePDS(ctx, repoInfo.DID)
+	if err != nil {
+		return nil, err
+	}
+
+	url := fmt.Sprintf("%s/xrpc/com.atproto.repo.listRecords?repo=%s&collection=%s&limit=%d",
+		pdsURL, repoInfo.DID, CollectionPull, limit)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query PDS: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("PDS returned HTTP %d: %s", resp.StatusCode, body)
+	}
+
+	var result struct {
+		Records []struct {
+			URI   string         `json:"uri"`
+			CID   string         `json:"cid"`
+			Value map[string]any `json:"value"`
+		} `json:"records"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("failed to decode response: %w", err)
+	}
+
+	var pulls []*Pull
+	for _, rec := range result.Records {
+		targetMap, _ := rec.Value["target"].(map[string]any)
+		if targetMap == nil {
+			continue
+		}
+
+		targetRepo, _ := targetMap["repo"].(string)
+		if targetRepo != repoInfo.DID && targetRepo != repoInfo.ATURI {
+			continue
+		}
+
+		pull := &Pull{
+			URI:       rec.URI,
+			CID:       rec.CID,
+			Title:     jsonStrFromMap(rec.Value, "title"),
+			Body:      jsonStrFromMap(rec.Value, "body"),
+			CreatedAt: jsonStrFromMap(rec.Value, "createdAt"),
+		}
+
+		if sourceMap, ok := rec.Value["source"].(map[string]any); ok {
+			pull.Source.Branch, _ = sourceMap["branch"].(string)
+			pull.Source.SHA, _ = sourceMap["sha"].(string)
+			pull.Source.Repo, _ = sourceMap["repo"].(string)
+		}
+
+		pull.Target.Repo = targetRepo
+		pull.Target.Branch, _ = targetMap["branch"].(string)
+		pull.Target.RepoDID, _ = targetMap["repoDid"].(string)
+
+		pulls = append(pulls, pull)
+	}
+
+	return pulls, nil
+}
+
+// jsonStrFromMap extracts a string field from a map[string]any (different from the
+// jsonStr helper in json_helpers.go which works with map[string]any from indigo records).
+func jsonStrFromMap(m map[string]any, key string) string {
+	v, _ := m[key].(string)
+	return v
 }

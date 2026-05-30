@@ -1,4 +1,4 @@
-module github.com/acheong/tangled-mcp-go
+module github.com/acheong08/tangled-go-sdk
 
 go 1.26.3
 

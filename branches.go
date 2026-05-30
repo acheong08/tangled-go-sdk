@@ -10,6 +10,7 @@ import (
 )
 
 // ListBranches lists branches for a repository by querying the knot's XRPC endpoint.
+// This works for public repos without authentication.
 func (c *Client) ListBranches(ctx context.Context, ownerSlashRepo string, limit int) ([]*Branch, error) {
 	repoInfo, err := c.ResolveRepo(ctx, ownerSlashRepo)
 	if err != nil {
@@ -20,12 +21,12 @@ func (c *Client) ListBranches(ctx context.Context, ownerSlashRepo string, limit 
 		limit = 50
 	}
 
-	token, err := c.getServiceToken(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get service token: %w", err)
+	// Use repoDid if available (newer format), otherwise fall back to did/repoName
+	repoID := repoInfo.DID + "/" + repoInfo.Name
+	if repoInfo.RepoDID != "" {
+		repoID = repoInfo.RepoDID
 	}
 
-	repoID := repoInfo.DID + "/" + repoInfo.Name
 	url := fmt.Sprintf("https://%s/xrpc/sh.tangled.repo.branches", repoInfo.Knot)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
@@ -33,7 +34,12 @@ func (c *Client) ListBranches(ctx context.Context, ownerSlashRepo string, limit 
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
-	req.Header.Set("Authorization", "Bearer "+token)
+	// Try with service token if available, otherwise attempt without auth
+	token, tokenErr := c.getServiceToken(ctx)
+	if tokenErr == nil {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+
 	q := req.URL.Query()
 	q.Set("repo", repoID)
 	q.Set("limit", strconv.Itoa(limit))

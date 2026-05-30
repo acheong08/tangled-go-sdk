@@ -2,7 +2,10 @@ package tangled
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"strconv"
 	"strings"
 	"time"
@@ -114,6 +117,8 @@ func (c *Client) GetIssue(ctx context.Context, ownerSlashRepo string, issueID in
 }
 
 // ListIssues lists issues for the specified repository.
+// With an authenticated client, it queries the user's PDS via xrpc.
+// With a public client, it falls back to direct PDS queries.
 func (c *Client) ListIssues(ctx context.Context, ownerSlashRepo string, limit int) ([]*Issue, error) {
 	repoInfo, err := c.ResolveRepo(ctx, ownerSlashRepo)
 	if err != nil {
@@ -124,6 +129,14 @@ func (c *Client) ListIssues(ctx context.Context, ownerSlashRepo string, limit in
 		limit = 50
 	}
 
+	if c.IsAuthenticated() {
+		return c.listIssuesAuthenticated(ctx, repoInfo, limit)
+	}
+	return c.listIssuesPublic(ctx, repoInfo, limit)
+}
+
+// listIssuesAuthenticated lists issues using the authenticated xrpc client.
+func (c *Client) listIssuesAuthenticated(ctx context.Context, repoInfo *RepoInfo, limit int) ([]*Issue, error) {
 	records, err := comatproto.RepoListRecords(ctx, c.xrpc, CollectionIssue, "", int64(limit), c.did, false)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list issues: %w", err)
@@ -156,6 +169,81 @@ func (c *Client) ListIssues(ctx context.Context, ownerSlashRepo string, limit in
 				issue.Labels = labels
 			}
 		}
+	}
+
+	return issues, nil
+}
+
+// listIssuesPublic lists issues using public PDS HTTP endpoints.
+func (c *Client) listIssuesPublic(ctx context.Context, repoInfo *RepoInfo, limit int) ([]*Issue, error) {
+	// Issues are stored on the creator's PDS, not the repo owner's PDS.
+	// For the public path, we query the repo owner's PDS for issues
+	// that reference this repo.
+	pdsURL, err := resolvePDS(ctx, repoInfo.DID)
+	if err != nil {
+		return nil, err
+	}
+
+	url := fmt.Sprintf("%s/xrpc/com.atproto.repo.listRecords?repo=%s&collection=%s&limit=%d",
+		pdsURL, repoInfo.DID, CollectionIssue, limit)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query PDS: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("PDS returned HTTP %d: %s", resp.StatusCode, body)
+	}
+
+	var result struct {
+		Records []struct {
+			URI   string         `json:"uri"`
+			CID   string         `json:"cid"`
+			Value map[string]any `json:"value"`
+		} `json:"records"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("failed to decode response: %w", err)
+	}
+
+	var issues []*Issue
+	for _, rec := range result.Records {
+		repo, _ := rec.Value["repo"].(string)
+		// Filter by repo AT-URI or owner DID
+		if repo != repoInfo.ATURI && repo != repoInfo.DID {
+			continue
+		}
+
+		id := 0
+		if f, ok := rec.Value["issueId"].(float64); ok {
+			id = int(f)
+		}
+		if id == 0 {
+			continue
+		}
+
+		title, _ := rec.Value["title"].(string)
+		body, _ := rec.Value["body"].(string)
+		owner, _ := rec.Value["owner"].(string)
+		createdAt, _ := rec.Value["createdAt"].(string)
+
+		issues = append(issues, &Issue{
+			URI:       rec.URI,
+			CID:       rec.CID,
+			ID:        id,
+			Title:     title,
+			Body:      body,
+			Owner:     owner,
+			CreatedAt: createdAt,
+		})
 	}
 
 	return issues, nil
