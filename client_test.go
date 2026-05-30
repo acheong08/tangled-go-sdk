@@ -36,7 +36,7 @@ func TestAuthenticatedClient(t *testing.T) {
 	ctx := context.Background()
 
 	// Resolve repo with authenticated client
-	repo, err := client.ResolveRepo(ctx, "tangled.org/core")
+	repo, err := client.ResolveRepo(ctx, "luddite.dev/pi")
 	if err != nil {
 		t.Fatalf("failed to resolve repo: %v", err)
 	}

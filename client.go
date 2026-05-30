@@ -48,15 +48,22 @@ type Config struct {
 	Handle string
 	// Password is the account password or app password.
 	Password string
-	// PDSHost is the optional PDS host (defaults to https://bsky.social).
+	// PDSHost is the optional PDS host. If empty, the correct PDS is
+	// auto-discovered by resolving the handle's DID via the PLC directory.
 	PDSHost string
 }
 
 // NewClient creates a new Tangled client by authenticating with the given config.
+// If PDSHost is not set, it auto-discovers the user's PDS by resolving the handle
+// to a DID and looking up the PLC directory.
 func NewClient(ctx context.Context, cfg Config) (*Client, error) {
 	pdsHost := cfg.PDSHost
 	if pdsHost == "" {
-		pdsHost = DefaultPDS
+		var err error
+		pdsHost, err = discoverPDS(ctx, cfg.Handle)
+		if err != nil {
+			return nil, fmt.Errorf("failed to discover PDS for handle %q: %w", cfg.Handle, err)
+		}
 	}
 
 	xrpcClient := &xrpc.Client{
@@ -273,6 +280,23 @@ func (c *Client) ListMyRepos(ctx context.Context) ([]*RepoInfo, error) {
 		repos = append(repos, buildRepoInfo(rec.Uri, rec.Cid, m, c.did, name))
 	}
 	return repos, nil
+}
+
+// discoverPDS resolves a handle to its PDS host by: handle → DID → PLC directory.
+// Falls back to DefaultPDS if any step fails.
+func discoverPDS(ctx context.Context, handle string) (string, error) {
+	// Step 1: Resolve handle to DID
+	did, err := resolveHandlePublic(ctx, handle)
+	if err != nil {
+		return DefaultPDS, fmt.Errorf("resolve handle: %w", err)
+	}
+
+	// Step 2: Look up PLC directory for PDS endpoint
+	pdsURL, err := resolvePDS(ctx, did)
+	if err != nil {
+		return DefaultPDS, fmt.Errorf("resolve PDS from DID: %w", err)
+	}
+	return pdsURL, nil
 }
 
 // resolveHandlePublic resolves a handle to a DID using the public PDS endpoint.
