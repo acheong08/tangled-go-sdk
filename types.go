@@ -14,8 +14,11 @@ type RepoInfo struct {
 	Name string `json:"name"`
 	// Knot is the hostname of the knot server hosting this repo.
 	Knot string `json:"knot"`
-	// ATURI is the full AT-URI of the repo record (e.g., "at://did:plc:.../sh.tangled.repo/3l...").
+	// ATURI is the primary AT-URI of the repo record (the canonical/older one with name field).
 	ATURI string `json:"atUri"`
+	// AltURIs are additional AT-URIs for the same repo (e.g., newer rkey-based records).
+	// Issues/PRs may reference any of these AT-URIs in their "repo" field.
+	AltURIs []string `json:"altUris,omitempty"`
 	// DID is the owner's DID.
 	DID string `json:"did"`
 	// Labels is a list of AT-URIs of label definitions this repo subscribes to.
@@ -72,6 +75,8 @@ type Pull struct {
 	URI string `json:"uri"`
 	// CID is the content identifier of the record.
 	CID string `json:"cid"`
+	// ID is the sequential pull request number.
+	ID int `json:"pullId"`
 	// Title is the pull request title.
 	Title string `json:"title"`
 	// Body is the optional pull request description.

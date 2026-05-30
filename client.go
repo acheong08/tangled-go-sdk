@@ -168,6 +168,12 @@ func (c *Client) ResolveRepo(ctx context.Context, ownerSlashRepo string) (*RepoI
 		return nil, fmt.Errorf("failed to list repos for %q: %w", owner, err)
 	}
 
+	// When there are multiple repo records with the same name (e.g., a newer
+	// rkey-based one and an older TID-based one), prefer the one with an explicit
+	// "name" field — it's the original record that issues/PRs reference via AT-URI.
+	var fallback *RepoInfo
+	var altURIs []string
+
 	for _, rec := range records {
 		name, _ := rec.Value["name"].(string)
 
@@ -181,7 +187,25 @@ func (c *Client) ResolveRepo(ctx context.Context, ownerSlashRepo string) (*RepoI
 		if name != repoName {
 			continue
 		}
-		return buildRepoInfo(rec.URI, rec.CID, rec.Value, ownerDID, repoName), nil
+
+		info := buildRepoInfo(rec.URI, rec.CID, rec.Value, ownerDID, repoName)
+		altURIs = append(altURIs, rec.URI)
+
+		// If this record has an explicit "name" field, it's the original/canonical record.
+		if _, hasName := rec.Value["name"]; hasName {
+			info.AltURIs = altURIs // might include self but that's ok
+			return info, nil
+		}
+
+		// Otherwise, keep it as fallback (newer rkey-based record without name field).
+		if fallback == nil {
+			fallback = info
+		}
+	}
+
+	if fallback != nil {
+		fallback.AltURIs = altURIs
+		return fallback, nil
 	}
 
 	return nil, fmt.Errorf("repo %q not found for owner %q", repoName, owner)
@@ -199,6 +223,9 @@ func (c *Client) ListMyRepos(ctx context.Context) ([]*RepoInfo, error) {
 	}
 
 	var repos []*RepoInfo
+	// Deduplicate: prefer records with an explicit "name" field (canonical).
+	seen := make(map[string]int) // name -> index into repos
+
 	for _, rec := range records {
 		name, _ := rec.Value["name"].(string)
 		knot, _ := rec.Value["knot"].(string)
@@ -212,7 +239,18 @@ func (c *Client) ListMyRepos(ctx context.Context) ([]*RepoInfo, error) {
 		if name == "" || knot == "" {
 			continue
 		}
-		repos = append(repos, buildRepoInfo(rec.URI, rec.CID, rec.Value, c.did, name))
+
+		info := buildRepoInfo(rec.URI, rec.CID, rec.Value, c.did, name)
+
+		if idx, exists := seen[name]; exists {
+			// Prefer the record with an explicit "name" field (canonical/older)
+			if _, hasName := rec.Value["name"]; hasName {
+				repos[idx] = info
+			}
+		} else {
+			seen[name] = len(repos)
+			repos = append(repos, info)
+		}
 	}
 	return repos, nil
 }
@@ -506,4 +544,19 @@ func extractRkey(uri string) (string, error) {
 		return "", fmt.Errorf("invalid AT-URI: %q", uri)
 	}
 	return parts[4], nil
+}
+
+// repoRefMatches checks if the given repo reference (from an issue/PR record) matches
+// the resolved RepoInfo. The repo field can be a DID, a RepoDID, the primary AT-URI,
+// or any alternate AT-URI for the same repo.
+func repoRefMatches(ref string, repoInfo *RepoInfo) bool {
+	if ref == repoInfo.DID || ref == repoInfo.RepoDID || ref == repoInfo.ATURI {
+		return true
+	}
+	for _, alt := range repoInfo.AltURIs {
+		if ref == alt {
+			return true
+		}
+	}
+	return false
 }

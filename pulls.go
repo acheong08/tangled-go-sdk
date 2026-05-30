@@ -3,11 +3,16 @@ package tangled
 import (
 	"context"
 	"fmt"
+	"strconv"
 )
 
 // ListPulls lists pull requests for the specified repository.
 // With an authenticated client, it queries the user's PDS for PRs they created.
 // With a public client, it falls back to ListPublicPulls (queries repo owner's PDS).
+//
+// Note: PDS-based PR listing is inherently limited — PRs are stored on the
+// creator's PDS, so listing the owner's PDS only shows PRs created by that
+// account. For repos with many external contributors, most PRs won't appear.
 func (c *Client) ListPulls(ctx context.Context, ownerSlashRepo string, limit int) ([]*Pull, error) {
 	repoInfo, err := c.ResolveRepo(ctx, ownerSlashRepo)
 	if err != nil {
@@ -30,25 +35,12 @@ func (c *Client) listPullsAuthenticated(ctx context.Context, repoInfo *RepoInfo,
 		return nil, fmt.Errorf("failed to list pulls: %w", err)
 	}
 
-	repoRef := repoInfo.DID
-	if repoInfo.RepoDID != "" {
-		repoRef = repoInfo.RepoDID
-	}
-
 	var pulls []*Pull
 	for _, rec := range records {
-		targetMap, _ := rec.Value["target"].(map[string]any)
-		if targetMap == nil {
+		if !pullMatchesRepo(rec.Value, repoInfo) {
 			continue
 		}
-
-		targetRepo, _ := targetMap["repo"].(string)
-		if targetRepo != repoRef && targetRepo != repoInfo.ATURI {
-			continue
-		}
-
-		pull := rawRecordToPull(rec)
-		pulls = append(pulls, pull)
+		pulls = append(pulls, rawRecordToPull(rec))
 	}
 
 	return pulls, nil
@@ -132,14 +124,14 @@ func (c *Client) GetPull(ctx context.Context, rkey string) (*Pull, error) {
 			continue
 		}
 
-		pull := rawRecordToPull(rec)
-		return pull, nil
+		return rawRecordToPull(rec), nil
 	}
 
 	return nil, fmt.Errorf("pull request with rkey %q not found", rkey)
 }
 
 // ListPublicPulls lists pull requests on a repository using public PDS queries.
+// This queries the repo owner's PDS, which only contains PRs created by the repo owner.
 func (c *Client) ListPublicPulls(ctx context.Context, ownerSlashRepo string, limit int) ([]*Pull, error) {
 	repoInfo, err := c.ResolveRepo(ctx, ownerSlashRepo)
 	if err != nil {
@@ -155,42 +147,48 @@ func (c *Client) ListPublicPulls(ctx context.Context, ownerSlashRepo string, lim
 		return nil, err
 	}
 
-	var records []pdsRecord
+	var accessToken string
 	if c.IsAuthenticated() {
-		// Authenticated: query owner's PDS with our token
-		records, err = pdsListRecords(ctx, pdsURL, repoInfo.DID, CollectionPull, limit, c.accessJWT)
-	} else {
-		records, err = pdsListRecords(ctx, pdsURL, repoInfo.DID, CollectionPull, limit, "")
+		accessToken = c.accessJWT
 	}
+
+	records, err := pdsListRecords(ctx, pdsURL, repoInfo.DID, CollectionPull, limit, accessToken)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query PDS: %w", err)
 	}
 
-	repoRef := repoInfo.DID
-	if repoInfo.RepoDID != "" {
-		repoRef = repoInfo.RepoDID
-	}
-
 	var pulls []*Pull
 	for _, rec := range records {
-		targetMap, _ := rec.Value["target"].(map[string]any)
-		if targetMap == nil {
+		if !pullMatchesRepo(rec.Value, repoInfo) {
 			continue
 		}
-
-		targetRepo, _ := targetMap["repo"].(string)
-		if targetRepo != repoRef && targetRepo != repoInfo.ATURI {
-			continue
-		}
-
-		pull := rawRecordToPull(rec)
-		pulls = append(pulls, pull)
+		pulls = append(pulls, rawRecordToPull(rec))
 	}
 
 	return pulls, nil
 }
 
+// pullMatchesRepo checks if a PR record targets the given repo.
+// It handles both the nested format (target.repo, target.branch) from the lexicon
+// and the flat format (targetRepo, targetBranch) found in older/production records.
+func pullMatchesRepo(m map[string]any, repoInfo *RepoInfo) bool {
+	// Nested format (lexicon): target: { repo: "did:...", branch: "..." }
+	if targetMap, ok := m["target"].(map[string]any); ok {
+		targetRepo, _ := targetMap["repo"].(string)
+		return repoRefMatches(targetRepo, repoInfo)
+	}
+
+	// Flat format (production): targetRepo: "at://...", targetBranch: "..."
+	if targetRepo, ok := m["targetRepo"].(string); ok {
+		return repoRefMatches(targetRepo, repoInfo)
+	}
+
+	return false
+}
+
 // rawRecordToPull converts a raw pdsRecord to a Pull.
+// It handles both the nested format (target/source objects) from the lexicon
+// and the flat format (targetRepo/targetBranch/source.branch) found in production.
 func rawRecordToPull(rec pdsRecord) *Pull {
 	pull := &Pull{
 		URI:       rec.URI,
@@ -200,20 +198,46 @@ func rawRecordToPull(rec pdsRecord) *Pull {
 		CreatedAt: jsonStr(rec.Value, "createdAt"),
 	}
 
+	// Pull ID (flat format uses "pullId")
+	if pullID := jsonFloat(rec.Value, "pullId"); pullID > 0 {
+		pull.ID = int(pullID)
+	}
+
+	// Source: nested format (source: { branch: "...", sha: "..." })
 	if sourceMap, ok := rec.Value["source"].(map[string]any); ok {
 		pull.Source.Branch, _ = sourceMap["branch"].(string)
 		pull.Source.SHA, _ = sourceMap["sha"].(string)
 		pull.Source.Repo, _ = sourceMap["repo"].(string)
 	}
 
+	// Target: nested format (target: { repo: "...", branch: "..." })
 	if targetMap, ok := rec.Value["target"].(map[string]any); ok {
 		pull.Target.Repo, _ = targetMap["repo"].(string)
 		pull.Target.Branch, _ = targetMap["branch"].(string)
-		// repoDid is a non-standard extension in target; read it if present
 		if rd, ok := targetMap["repoDid"].(string); ok {
 			pull.Target.RepoDID = rd
+		}
+	} else {
+		// Target: flat format (targetRepo, targetBranch as top-level strings)
+		if tr, ok := rec.Value["targetRepo"].(string); ok {
+			pull.Target.Repo = tr
+		}
+		if tb, ok := rec.Value["targetBranch"].(string); ok {
+			pull.Target.Branch = tb
 		}
 	}
 
 	return pull
+}
+
+// formatPullID returns a display string for a pull request ID.
+func formatPullID(pull *Pull) string {
+	if pull.ID > 0 {
+		return strconv.Itoa(pull.ID)
+	}
+	rkey, err := extractRkey(pull.URI)
+	if err != nil {
+		return "?"
+	}
+	return rkey
 }

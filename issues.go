@@ -34,9 +34,9 @@ func (c *Client) CreateIssue(ctx context.Context, ownerSlashRepo string, params 
 	createdAt := nowISO()
 
 	// Use RepoDID (stable repo identity) for the repo field, falling back to owner DID
-	repoRef := repoInfo.DID
-	if repoInfo.RepoDID != "" {
-		repoRef = repoInfo.RepoDID
+	repoRef := repoInfo.RepoDID
+	if repoRef == "" {
+		repoRef = repoInfo.DID
 	}
 
 	record := map[string]any{
@@ -92,14 +92,9 @@ func (c *Client) GetIssue(ctx context.Context, ownerSlashRepo string, issueID in
 		return nil, fmt.Errorf("failed to list issues: %w", err)
 	}
 
-	repoRef := repoInfo.DID
-	if repoInfo.RepoDID != "" {
-		repoRef = repoInfo.RepoDID
-	}
-
 	for _, rec := range records {
 		repo, _ := rec.Value["repo"].(string)
-		if repo != repoRef && repo != repoInfo.ATURI {
+		if !repoRefMatches(repo, repoInfo) {
 			continue
 		}
 		id := int(jsonFloat(rec.Value, "issueId"))
@@ -140,15 +135,10 @@ func (c *Client) listIssuesAuthenticated(ctx context.Context, repoInfo *RepoInfo
 		return nil, fmt.Errorf("failed to list issues: %w", err)
 	}
 
-	repoRef := repoInfo.DID
-	if repoInfo.RepoDID != "" {
-		repoRef = repoInfo.RepoDID
-	}
-
 	var issues []*Issue
 	for _, rec := range records {
 		repo, _ := rec.Value["repo"].(string)
-		if repo != repoRef && repo != repoInfo.ATURI {
+		if !repoRefMatches(repo, repoInfo) {
 			continue
 		}
 		id := int(jsonFloat(rec.Value, "issueId"))
@@ -186,15 +176,10 @@ func (c *Client) listIssuesPublic(ctx context.Context, repoInfo *RepoInfo, limit
 		return nil, fmt.Errorf("failed to list issues: %w", err)
 	}
 
-	repoRef := repoInfo.DID
-	if repoInfo.RepoDID != "" {
-		repoRef = repoInfo.RepoDID
-	}
-
 	var issues []*Issue
 	for _, rec := range records {
 		repo, _ := rec.Value["repo"].(string)
-		if repo != repoRef && repo != repoInfo.ATURI {
+		if !repoRefMatches(repo, repoInfo) {
 			continue
 		}
 		id := int(jsonFloat(rec.Value, "issueId"))
@@ -222,11 +207,6 @@ func (c *Client) UpdateIssue(ctx context.Context, ownerSlashRepo string, params 
 		return nil, fmt.Errorf("failed to list issues: %w", err)
 	}
 
-	repoRef := repoInfo.DID
-	if repoInfo.RepoDID != "" {
-		repoRef = repoInfo.RepoDID
-	}
-
 	var (
 		existingMap  map[string]any
 		existingCID  string
@@ -234,7 +214,7 @@ func (c *Client) UpdateIssue(ctx context.Context, ownerSlashRepo string, params 
 	)
 	for _, rec := range records {
 		repo, _ := rec.Value["repo"].(string)
-		if repo != repoRef && repo != repoInfo.ATURI {
+		if !repoRefMatches(repo, repoInfo) {
 			continue
 		}
 		id := int(jsonFloat(rec.Value, "issueId"))
@@ -327,14 +307,9 @@ func (c *Client) DeleteIssue(ctx context.Context, ownerSlashRepo string, issueID
 		return fmt.Errorf("failed to list issues: %w", err)
 	}
 
-	repoRef := repoInfo.DID
-	if repoInfo.RepoDID != "" {
-		repoRef = repoInfo.RepoDID
-	}
-
 	for _, rec := range records {
 		repo, _ := rec.Value["repo"].(string)
-		if repo != repoRef && repo != repoInfo.ATURI {
+		if !repoRefMatches(repo, repoInfo) {
 			continue
 		}
 		id := int(jsonFloat(rec.Value, "issueId"))
@@ -391,15 +366,10 @@ func (c *Client) nextIssueID(ctx context.Context, repoInfo *RepoInfo) (int, erro
 		return 0, fmt.Errorf("failed to list existing issues: %w", err)
 	}
 
-	repoRef := repoInfo.DID
-	if repoInfo.RepoDID != "" {
-		repoRef = repoInfo.RepoDID
-	}
-
 	maxID := 0
 	for _, rec := range records {
 		repo, _ := rec.Value["repo"].(string)
-		if repo != repoRef && repo != repoInfo.ATURI {
+		if !repoRefMatches(repo, repoInfo) {
 			continue
 		}
 		id := int(jsonFloat(rec.Value, "issueId"))
