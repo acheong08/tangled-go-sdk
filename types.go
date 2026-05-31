@@ -29,6 +29,12 @@ type RepoInfo struct {
 	RepoDID string `json:"repoDid,omitempty"`
 }
 
+// IssueStateOpen is the state value for an open issue.
+const IssueStateOpen = "sh.tangled.repo.issue.state.open"
+
+// IssueStateClosed is the state value for a closed issue.
+const IssueStateClosed = "sh.tangled.repo.issue.state.closed"
+
 // Issue represents a Tangled issue on a repository.
 type Issue struct {
 	// URI is the AT-URI of the issue record.
@@ -41,6 +47,9 @@ type Issue struct {
 	Title string `json:"title"`
 	// Body is the optional issue body/description.
 	Body string `json:"body,omitempty"`
+	// State is the current state of the issue (e.g., IssueStateOpen, IssueStateClosed).
+	// Open is the default for issues without a state record.
+	State string `json:"state,omitempty"`
 	// Owner is the DID of the issue creator.
 	Owner string `json:"owner,omitempty"`
 	// Labels is a list of label names applied to the issue.
@@ -76,6 +85,9 @@ type UpdateIssueParams struct {
 	Title *string
 	// Body is the new body. nil means don't change; pointer to "" means clear.
 	Body *string
+	// State is the new state (e.g., IssueStateOpen, IssueStateClosed). Empty means don't change.
+	// Setting this creates or updates a sh.tangled.repo.issue.state record.
+	State string
 	// Labels replaces all existing labels. Use empty slice to clear all labels.
 	// Nil means don't change labels.
 	Labels []string

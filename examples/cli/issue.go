@@ -18,6 +18,7 @@ func issueCmd() *cobra.Command {
 	cmd.AddCommand(issueCreateCmd())
 	cmd.AddCommand(issueShowCmd())
 	cmd.AddCommand(issueCloseCmd())
+	cmd.AddCommand(issueReopenCmd())
 	cmd.AddCommand(issueCommentCmd())
 
 	return cmd
@@ -45,7 +46,7 @@ func issueListCmd() *cobra.Command {
 			}
 
 			for _, i := range issues {
-				fmt.Printf("#%d\t%s\t%s\n", i.ID, i.Title, i.CreatedAt)
+				fmt.Printf("#%d\t[%s]\t%s\t%s\n", i.ID, shortState(i.State), i.Title, i.CreatedAt)
 			}
 			return nil
 		},
@@ -118,7 +119,7 @@ func issueShowCmd() *cobra.Command {
 				return err
 			}
 
-			fmt.Printf("Issue #%d: %s\n", issue.ID, issue.Title)
+			fmt.Printf("Issue #%d [%s]: %s\n", issue.ID, shortState(issue.State), issue.Title)
 			if issue.Body != "" {
 				fmt.Println()
 				fmt.Println(issue.Body)
@@ -136,7 +137,7 @@ func issueShowCmd() *cobra.Command {
 func issueCloseCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "close <owner/repo> <issue-id>",
-		Short: "Delete an issue",
+		Short: "Close an issue",
 		Args:  cobra.ExactArgs(2),
 		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
 			return initConfig()
@@ -152,11 +153,40 @@ func issueCloseCmd() *cobra.Command {
 				return fmt.Errorf("invalid issue ID %q: %w", args[1], err)
 			}
 
-			if err := client.DeleteIssue(context.Background(), args[0], issueID); err != nil {
+			if err := client.CloseIssue(context.Background(), args[0], issueID); err != nil {
 				return err
 			}
 
-			fmt.Printf("Deleted issue #%d\n", issueID)
+			fmt.Printf("Closed issue #%d\n", issueID)
+			return nil
+		},
+	}
+}
+
+func issueReopenCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "reopen <owner/repo> <issue-id>",
+		Short: "Reopen a closed issue",
+		Args:  cobra.ExactArgs(2),
+		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+			return initConfig()
+		},
+		RunE: func(cmd *cobra.Command, args []string) error {
+			client, err := newClient(context.Background())
+			if err != nil {
+				return err
+			}
+
+			var issueID int
+			if _, err := fmt.Sscanf(args[1], "%d", &issueID); err != nil {
+				return fmt.Errorf("invalid issue ID %q: %w", args[1], err)
+			}
+
+			if err := client.ReopenIssue(context.Background(), args[0], issueID); err != nil {
+				return err
+			}
+
+			fmt.Printf("Reopened issue #%d\n", issueID)
 			return nil
 		},
 	}
@@ -199,4 +229,19 @@ func issueCommentCmd() *cobra.Command {
 	cmd.Flags().StringVarP(&body, "body", "m", "", "Comment body (required)")
 
 	return cmd
+}
+
+// shortState returns a short human-readable label for an issue state.
+func shortState(state string) string {
+	switch state {
+	case tangled.IssueStateClosed:
+		return "closed"
+	case tangled.IssueStateOpen:
+		return "open"
+	default:
+		if state == "" {
+			return "open"
+		}
+		return state
+	}
 }

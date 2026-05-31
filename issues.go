@@ -104,6 +104,11 @@ func (c *Client) GetIssue(ctx context.Context, ownerSlashRepo string, issueID in
 
 		issue := rawRecordToIssue(rec)
 		issue.Labels, _ = c.getIssueLabels(ctx, issue.URI)
+		// Resolve issue state
+		state, _ := c.getIssueState(ctx, issue.URI)
+		if state != "" {
+			issue.State = state
+		}
 		return issue, nil
 	}
 
@@ -148,6 +153,16 @@ func (c *Client) listIssuesAuthenticated(ctx context.Context, repoInfo *RepoInfo
 		issues = append(issues, rawRecordToIssue(rec))
 	}
 
+	// Resolve issue states (closed issues have sh.tangled.repo.issue.state records)
+	if len(issues) > 0 {
+		stateMap, _ := c.getIssueStates(ctx, issues)
+		for _, issue := range issues {
+			if state, ok := stateMap[issue.URI]; ok {
+				issue.State = state
+			}
+		}
+	}
+
 	// Fetch labels in one pass
 	issueURIs := make([]string, len(issues))
 	for i, issue := range issues {
@@ -188,6 +203,41 @@ func (c *Client) listIssuesPublic(ctx context.Context, repoInfo *RepoInfo, limit
 		}
 		issues = append(issues, rawRecordToIssue(rec))
 	}
+
+	// Resolve issue states from the owner's PDS
+	if len(issues) > 0 {
+		accessToken := ""
+		if c.IsAuthenticated() {
+			accessToken = c.accessJWT
+		}
+		stateRecords, err := pdsListRecords(ctx, pdsURL, repoInfo.DID, CollectionIssueState, 100, accessToken)
+		if err == nil {
+			// Build URI -> latest state map (replay in order, last write wins)
+			uriToState := make(map[string]string)
+			issueURISet := make(map[string]bool)
+			for _, issue := range issues {
+				issueURISet[issue.URI] = true
+			}
+			for _, rec := range stateRecords {
+				issueAtURI := jsonStr(rec.Value, "issue")
+				if !issueURISet[issueAtURI] {
+					continue
+			}
+				state := jsonStr(rec.Value, "state")
+				// listRecords returns in reverse chronological order (newest first),
+				// so the first match is the latest state
+				if _, exists := uriToState[issueAtURI]; !exists {
+					uriToState[issueAtURI] = state
+				}
+			}
+			for _, issue := range issues {
+				if state, ok := uriToState[issue.URI]; ok {
+					issue.State = state
+				}
+			}
+		}
+	}
+
 	return issues, nil
 }
 
@@ -273,6 +323,22 @@ func (c *Client) UpdateIssue(ctx context.Context, ownerSlashRepo string, params 
 		Body:      body,
 		Owner:     owner,
 		CreatedAt: createdAt,
+	}
+
+	// Handle state change
+	if params.State != "" {
+		if err := c.setIssueState(ctx, uri, params.State); err != nil {
+			return nil, fmt.Errorf("failed to set issue state: %w", err)
+		}
+		result.State = params.State
+	} else {
+		// Preserve existing state
+		state, _ := c.getIssueState(ctx, uri)
+		if state != "" {
+			result.State = state
+		} else {
+			result.State = IssueStateOpen
+		}
 	}
 
 	if params.Labels != nil {
@@ -421,6 +487,7 @@ func rawRecordToIssue(rec pdsRecord) *Issue {
 		ID:        int(jsonFloat(rec.Value, "issueId")),
 		Title:     jsonStr(rec.Value, "title"),
 		Body:      jsonStr(rec.Value, "body"),
+		State:     IssueStateOpen, // default; will be overridden if a state record exists
 		Owner:     jsonStr(rec.Value, "owner"),
 		CreatedAt: jsonStr(rec.Value, "createdAt"),
 	}
@@ -659,4 +726,130 @@ func (c *Client) getLabelsForIssues(ctx context.Context, issueURIs []string) (ma
 		out[uri] = labels
 	}
 	return out, nil
+}
+
+// CloseIssue closes an issue by creating a sh.tangled.repo.issue.state record
+// with state "sh.tangled.repo.issue.state.closed".
+// This follows the ATProto event-sourcing pattern where state is stored separately
+// from the issue record itself.
+func (c *Client) CloseIssue(ctx context.Context, ownerSlashRepo string, issueID int) error {
+	return c.setIssueStateByID(ctx, ownerSlashRepo, issueID, IssueStateClosed)
+}
+
+// ReopenIssue reopens a closed issue by creating a sh.tangled.repo.issue.state record
+// with state "sh.tangled.repo.issue.state.open".
+func (c *Client) ReopenIssue(ctx context.Context, ownerSlashRepo string, issueID int) error {
+	return c.setIssueStateByID(ctx, ownerSlashRepo, issueID, IssueStateOpen)
+}
+
+// setIssueStateByID sets the state of an issue by its numeric ID.
+func (c *Client) setIssueStateByID(ctx context.Context, ownerSlashRepo string, issueID int, state string) error {
+	if err := c.requireAuth(); err != nil {
+		return err
+	}
+
+	repoInfo, err := c.ResolveRepo(ctx, ownerSlashRepo)
+	if err != nil {
+		return err
+	}
+
+	// Find the issue record to get its AT-URI
+	records, err := c.pdsListRecords(ctx, CollectionIssue, 100)
+	if err != nil {
+		return fmt.Errorf("failed to list issues: %w", err)
+	}
+
+	var issueURI string
+	for _, rec := range records {
+		repo, _ := rec.Value["repo"].(string)
+		if !repoRefMatches(repo, repoInfo) {
+			continue
+		}
+		id := int(jsonFloat(rec.Value, "issueId"))
+		if id != issueID {
+			continue
+		}
+		issueURI = rec.URI
+		break
+	}
+
+	if issueURI == "" {
+		return fmt.Errorf("issue #%d not found in repo %s", issueID, ownerSlashRepo)
+	}
+
+	return c.setIssueState(ctx, issueURI, state)
+}
+
+// setIssueState creates or updates a sh.tangled.repo.issue.state record for the given issue AT-URI.
+func (c *Client) setIssueState(ctx context.Context, issueURI, state string) error {
+	rkey := generateTID()
+
+	record := map[string]any{
+		"$type":     CollectionIssueState,
+		"issue":     issueURI,
+		"state":     state,
+		"createdAt": nowISO(),
+	}
+
+	_, _, err := c.pdsPutRecord(ctx, CollectionIssueState, rkey, record, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create issue state record: %w", err)
+	}
+	return nil
+}
+
+// getIssueState returns the current state of an issue by replaying state records.
+// Returns empty string if no state record exists (which means open).
+func (c *Client) getIssueState(ctx context.Context, issueURI string) (string, error) {
+	records, err := c.pdsListRecords(ctx, CollectionIssueState, 100)
+	if err != nil {
+		return "", err
+	}
+
+	// Find the latest state for this issue
+	var latestState string
+	var latestCreatedAt string
+	for _, rec := range records {
+		issueAtURI := jsonStr(rec.Value, "issue")
+		if issueAtURI != issueURI {
+			continue
+		}
+		state := jsonStr(rec.Value, "state")
+		createdAt := jsonStr(rec.Value, "createdAt")
+		if createdAt >= latestCreatedAt { // >= picks the last one if timestamps match
+			latestState = state
+			latestCreatedAt = createdAt
+		}
+	}
+
+	return latestState, nil
+}
+
+// getIssueStates returns a map of issue AT-URI → current state for the given issues.
+func (c *Client) getIssueStates(ctx context.Context, issues []*Issue) (map[string]string, error) {
+	records, err := c.pdsListRecords(ctx, CollectionIssueState, 100)
+	if err != nil {
+		return nil, err
+	}
+
+	// Build a set of issue URIs we care about
+	uriSet := make(map[string]bool)
+	for _, issue := range issues {
+		uriSet[issue.URI] = true
+	}
+
+	// listRecords returns newest first, so first write wins
+	result := make(map[string]string)
+	for _, rec := range records {
+		issueAtURI := jsonStr(rec.Value, "issue")
+		if !uriSet[issueAtURI] {
+			continue
+		}
+		state := jsonStr(rec.Value, "state")
+		if _, exists := result[issueAtURI]; !exists {
+			result[issueAtURI] = state
+		}
+	}
+
+	return result, nil
 }

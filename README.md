@@ -64,6 +64,12 @@ issue, _ := client.CreateIssue(ctx, "owner/repo", tangled.CreateIssueParams{
     Labels: []string{"bug"},
 })
 
+// Close an issue (creates a sh.tangled.repo.issue.state record)
+client.CloseIssue(ctx, "owner/repo", issue.ID)
+
+// Reopen an issue
+client.ReopenIssue(ctx, "owner/repo", issue.ID)
+
 // Comment on the issue
 comment, _ := client.CreateComment(ctx, tangled.CreateCommentParams{
     Body:           "Confirmed, I can reproduce this.",
@@ -76,9 +82,10 @@ updated, _ := client.UpdateIssue(ctx, "owner/repo", tangled.UpdateIssueParams{
     IssueID: issue.ID,
     Title:   tangled.StringPtr("Updated title"),
     Body:    tangled.StringPtr("Updated body"),
+    State:   tangled.IssueStateClosed, // can also change state via UpdateIssue
 })
 
-// Delete an issue
+// Delete an issue (permanently removes the PDS record)
 client.DeleteIssue(ctx, "owner/repo", issue.ID)
 ```
 
@@ -102,11 +109,13 @@ client.DeleteIssue(ctx, "owner/repo", issue.ID)
 
 | Method                                   | Auth     | Description                           |
 | ---------------------------------------- | -------- | ------------------------------------- |
-| `ListIssues(ctx, "owner/repo", limit)`   | Either   | List issues for a repo                |
-| `GetIssue(ctx, "owner/repo", id)`        | Required | Get a specific issue by ID            |
+| `ListIssues(ctx, "owner/repo", limit)`   | Either   | List issues for a repo (includes state) |
+| `GetIssue(ctx, "owner/repo", id)`        | Required | Get a specific issue by ID (includes state) |
 | `CreateIssue(ctx, "owner/repo", params)` | Required | Create a new issue                    |
-| `UpdateIssue(ctx, "owner/repo", params)` | Required | Update an existing issue              |
-| `DeleteIssue(ctx, "owner/repo", id)`     | Required | Delete an issue                       |
+| `UpdateIssue(ctx, "owner/repo", params)` | Required | Update title/body/state/labels       |
+| `CloseIssue(ctx, "owner/repo", id)`      | Required | Close an issue (creates state record) |
+| `ReopenIssue(ctx, "owner/repo", id)`      | Required | Reopen a closed issue                |
+| `DeleteIssue(ctx, "owner/repo", id)`      | Required | Permanently delete an issue record    |
 | `ListLabels(ctx, "owner/repo")`          | Either   | List available label names for a repo |
 
 ### Comment Operations
@@ -149,6 +158,7 @@ tangled issue list owner/repo
 tangled issue create owner/repo -t "Bug report" -b "Description" -l bug
 tangled issue show owner/repo 1
 tangled issue close owner/repo 1
+tangled issue reopen owner/repo 1
 tangled issue comment owner/repo 1 -m "Confirmed"
 
 # Branches
@@ -165,6 +175,7 @@ PDS (Personal Data Server), not on a central server:
 
 - **Repositories** are records (`sh.tangled.repo`) on the owner's PDS
 - **Issues** are records (`sh.tangled.repo.issue`) on the **creator's** PDS
+- **Issue state** uses event-sourcing via separate records (`sh.tangled.repo.issue.state`) on the **closer's** PDS — closed/open state is not stored on the issue record itself
 - **Comments** are records (`sh.tangled.feed.comment`) on the **commenter's** PDS
 - **Branches** are queried from the **knot server** (the git host)
 

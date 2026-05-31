@@ -27,6 +27,9 @@ const (
 	// CollectionLabelOp is the atproto collection for Tangled label operation records.
 	CollectionLabelOp = "sh.tangled.label.op"
 
+	// CollectionIssueState is the atproto collection for Tangled issue state records.
+	CollectionIssueState = "sh.tangled.repo.issue.state"
+
 	// CollectionComment is the atproto collection for Tangled comment records.
 	CollectionComment = "sh.tangled.feed.comment"
 
