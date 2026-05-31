@@ -17,7 +17,6 @@ func main() {
 	rootCmd.AddCommand(whoamiCmd())
 	rootCmd.AddCommand(repoCmd())
 	rootCmd.AddCommand(issueCmd())
-	rootCmd.AddCommand(pullCmd())
 	rootCmd.AddCommand(branchCmd())
 	rootCmd.AddCommand(labelCmd())
 

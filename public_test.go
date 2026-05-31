@@ -117,21 +117,6 @@ func TestPublicListIssues(t *testing.T) {
 	}
 }
 
-func TestPublicListPulls(t *testing.T) {
-	client := NewPublicClient()
-	ctx := context.Background()
-
-	pulls, err := client.ListPublicPulls(ctx, "tangled.org/core", 10)
-	if err != nil {
-		t.Fatalf("failed to list pulls: %v", err)
-	}
-
-	t.Logf("Found %d pull requests on tangled.org/core (owner's PDS)", len(pulls))
-	for _, pull := range pulls {
-		t.Logf("  %s: %s -> %s", truncate(pull.Title, 40), pull.Source.Branch, pull.Target.Branch)
-	}
-}
-
 func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s

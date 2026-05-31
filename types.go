@@ -1,5 +1,5 @@
 // Package tangled provides a Go client library for the Tangled git collaboration
-// platform built on the AT Protocol. It supports managing issues, pull requests,
+// platform built on the AT Protocol. It supports managing issues
 // and branches on Tangled repositories.
 package tangled
 
@@ -49,46 +49,6 @@ type Issue struct {
 	CreatedAt string `json:"createdAt"`
 }
 
-// PullSource describes the source branch of a pull request.
-type PullSource struct {
-	// Branch is the source branch name.
-	Branch string `json:"branch"`
-	// SHA is the commit hash of the source branch tip (may be empty for older records).
-	SHA string `json:"sha,omitempty"`
-	// Repo is the AT-URI of the source repo (for cross-repo PRs).
-	Repo string `json:"repo,omitempty"`
-}
-
-// PullTarget describes the target branch of a pull request.
-type PullTarget struct {
-	// Repo is the DID of the repo being targeted.
-	Repo string `json:"repo"`
-	// Branch is the target branch name.
-	Branch string `json:"branch"`
-	// RepoDID is the DID of the target repository itself (newer format).
-	RepoDID string `json:"repoDid,omitempty"`
-}
-
-// Pull represents a Tangled pull request.
-type Pull struct {
-	// URI is the AT-URI of the pull record.
-	URI string `json:"uri"`
-	// CID is the content identifier of the record.
-	CID string `json:"cid"`
-	// ID is the sequential pull request number.
-	ID int `json:"pullId"`
-	// Title is the pull request title.
-	Title string `json:"title"`
-	// Body is the optional pull request description.
-	Body string `json:"body,omitempty"`
-	// Source describes the source branch.
-	Source PullSource `json:"source"`
-	// Target describes the target branch.
-	Target PullTarget `json:"target"`
-	// CreatedAt is the ISO 8601 timestamp of when the PR was created.
-	CreatedAt string `json:"createdAt"`
-}
-
 // Branch represents a git branch on a Tangled repository.
 type Branch struct {
 	// Name is the branch name.
@@ -124,19 +84,7 @@ type UpdateIssueParams struct {
 // StringPtr is a helper to create a *string from a string literal.
 func StringPtr(s string) *string { return &s }
 
-// CreatePullParams contains the parameters for creating a pull request.
-type CreatePullParams struct {
-	// Title is the PR title (required).
-	Title string
-	// Body is the optional PR description.
-	Body string
-	// SourceBranch is the branch containing changes (required).
-	SourceBranch string
-	// TargetBranch is the branch to merge into (default: "main").
-	TargetBranch string
-}
-
-// Comment represents a Tangled comment on an issue or pull request.
+// Comment represents a Tangled comment on an issue.
 type Comment struct {
 	// URI is the AT-URI of the comment record.
 	URI string `json:"uri"`
@@ -144,7 +92,7 @@ type Comment struct {
 	CID string `json:"cid"`
 	// Body is the comment text.
 	Body string `json:"body"`
-	// SubjectURI is the AT-URI of the record this comment is on (issue/PR/comment).
+	// SubjectURI is the AT-URI of the record this comment is on (issue/comment).
 	SubjectURI string `json:"subjectUri"`
 	// SubjectCID is the CID of the record this comment is on.
 	SubjectCID string `json:"subjectCid"`
@@ -162,8 +110,10 @@ type CreateCommentParams struct {
 	Body string
 	// OwnerSlashRepo is the repository in "owner/repo" format (required).
 	OwnerSlashRepo string
-	// IssueID is the issue or PR number to comment on (required).
-	IssueID int
+	// SubjectRef identifies what to comment on. It can be:
+	//   - A numeric issue ID like "1" or "42" (resolves via issue list)
+	//   - A full AT-URI like "at://did:plc:.../sh.tangled.repo.issue/rkey"
+	SubjectRef string
 	// ReplyToURI is the AT-URI of the parent comment for threaded replies (optional).
 	ReplyToURI string
 	// ReplyToCID is the CID of the parent comment (required if ReplyToURI is set).

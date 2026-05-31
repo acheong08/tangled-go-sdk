@@ -24,9 +24,6 @@ const (
 	// CollectionIssue is the atproto collection for Tangled issue records.
 	CollectionIssue = "sh.tangled.repo.issue"
 
-	// CollectionPull is the atproto collection for Tangled pull request records.
-	CollectionPull = "sh.tangled.repo.pull"
-
 	// CollectionLabelOp is the atproto collection for Tangled label operation records.
 	CollectionLabelOp = "sh.tangled.label.op"
 
@@ -41,7 +38,7 @@ const (
 var httpClient = &http.Client{Timeout: 30 * time.Second}
 
 // Client is a Tangled API client that authenticates via AT Protocol
-// and provides operations for issues, pull requests, and branches.
+// and provides operations for issues and branches.
 type Client struct {
 	xrpc      *xrpc.Client
 	did       string
@@ -326,6 +323,37 @@ func pdsListRecords(ctx context.Context, pdsURL, repo, collection string, limit 
 		return nil, fmt.Errorf("failed to decode PDS response: %w", err)
 	}
 	return result.Records, nil
+}
+
+// pdsGetRecord fetches a single record by collection and rkey via the PDS getRecord endpoint.
+func pdsGetRecord(ctx context.Context, pdsURL, repo, collection, rkey, accessToken string) (pdsRecord, error) {
+	url := fmt.Sprintf("%s/xrpc/com.atproto.repo.getRecord?repo=%s&collection=%s&rkey=%s",
+		pdsURL, repo, collection, rkey)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return pdsRecord{}, err
+	}
+	if accessToken != "" {
+		req.Header.Set("Authorization", "Bearer "+accessToken)
+	}
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return pdsRecord{}, fmt.Errorf("PDS request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return pdsRecord{}, fmt.Errorf("PDS returned HTTP %d: %s", resp.StatusCode, body)
+	}
+
+	var record pdsRecord
+	if err := json.NewDecoder(resp.Body).Decode(&record); err != nil {
+		return pdsRecord{}, fmt.Errorf("failed to decode PDS response: %w", err)
+	}
+	return record, nil
 }
 
 // pdsPutRecord creates or replaces a record via raw HTTP to a PDS endpoint.

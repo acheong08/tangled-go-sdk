@@ -182,21 +182,16 @@ func issueCommentCmd() *cobra.Command {
 				return fmt.Errorf("body is required (use --body or -m)")
 			}
 
-			var id int
-			if _, err := fmt.Sscanf(args[1], "%d", &id); err != nil {
-				return fmt.Errorf("invalid issue ID %q: %w", args[1], err)
-			}
-
 			comment, err := client.CreateComment(context.Background(), tangled.CreateCommentParams{
 				Body:           body,
 				OwnerSlashRepo: args[0],
-				IssueID:        id,
+				SubjectRef:     args[1],
 			})
 			if err != nil {
 				return err
 			}
 
-			fmt.Printf("Comment created on issue #%d: %s\n", id, comment.URI)
+			fmt.Printf("Comment created on issue #%s: %s\n", args[1], comment.URI)
 			return nil
 		},
 	}
