@@ -15,10 +15,11 @@ func main() {
 
 	rootCmd.AddCommand(loginCmd())
 	rootCmd.AddCommand(whoamiCmd())
-	rootCmd.AddCommand(listCmd())
+	rootCmd.AddCommand(repoCmd())
 	rootCmd.AddCommand(issueCmd())
 	rootCmd.AddCommand(pullCmd())
-	rootCmd.AddCommand(commentCmd())
+	rootCmd.AddCommand(branchCmd())
+	rootCmd.AddCommand(labelCmd())
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)

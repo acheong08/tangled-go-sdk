@@ -14,11 +14,42 @@ func issueCmd() *cobra.Command {
 		Short: "Manage issues",
 	}
 
+	cmd.AddCommand(issueListCmd())
 	cmd.AddCommand(issueCreateCmd())
 	cmd.AddCommand(issueShowCmd())
 	cmd.AddCommand(issueCloseCmd())
+	cmd.AddCommand(issueCommentCmd())
 
 	return cmd
+}
+
+func issueListCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "list <owner/repo>",
+		Short: "List issues on a repository",
+		Args:  cobra.ExactArgs(1),
+		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+			return initConfig()
+		},
+		RunE: func(cmd *cobra.Command, args []string) error {
+			client := tangled.NewPublicClient()
+
+			issues, err := client.ListIssues(context.Background(), args[0], 50)
+			if err != nil {
+				return err
+			}
+
+			if len(issues) == 0 {
+				fmt.Println("No issues found.")
+				return nil
+			}
+
+			for _, i := range issues {
+				fmt.Printf("#%d\t%s\t%s\n", i.ID, i.Title, i.CreatedAt)
+			}
+			return nil
+		},
+	}
 }
 
 func issueCreateCmd() *cobra.Command {
@@ -129,4 +160,48 @@ func issueCloseCmd() *cobra.Command {
 			return nil
 		},
 	}
+}
+
+func issueCommentCmd() *cobra.Command {
+	var body string
+
+	cmd := &cobra.Command{
+		Use:   "comment <owner/repo> <issue-id>",
+		Short: "Comment on an issue",
+		Args:  cobra.ExactArgs(2),
+		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+			return initConfig()
+		},
+		RunE: func(cmd *cobra.Command, args []string) error {
+			client, err := newClient(context.Background())
+			if err != nil {
+				return err
+			}
+
+			if body == "" {
+				return fmt.Errorf("body is required (use --body or -m)")
+			}
+
+			var id int
+			if _, err := fmt.Sscanf(args[1], "%d", &id); err != nil {
+				return fmt.Errorf("invalid issue ID %q: %w", args[1], err)
+			}
+
+			comment, err := client.CreateComment(context.Background(), tangled.CreateCommentParams{
+				Body:           body,
+				OwnerSlashRepo: args[0],
+				IssueID:        id,
+			})
+			if err != nil {
+				return err
+			}
+
+			fmt.Printf("Comment created on issue #%d: %s\n", id, comment.URI)
+			return nil
+		},
+	}
+
+	cmd.Flags().StringVarP(&body, "body", "m", "", "Comment body (required)")
+
+	return cmd
 }
