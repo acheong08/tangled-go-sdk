@@ -6,8 +6,7 @@ import (
 )
 
 // CreateComment creates a comment on an issue or pull request.
-// The SubjectURI and SubjectCID should reference the issue or PR record
-// (obtained from Issue.URI + Issue.CID, or Pull.URI + Pull.CID).
+// It resolves the issue/PR ID to the AT-URI and CID automatically.
 func (c *Client) CreateComment(ctx context.Context, params CreateCommentParams) (*Comment, error) {
 	if err := c.requireAuth(); err != nil {
 		return nil, err
@@ -15,8 +14,17 @@ func (c *Client) CreateComment(ctx context.Context, params CreateCommentParams) 
 	if params.Body == "" {
 		return nil, fmt.Errorf("body is required")
 	}
-	if params.SubjectURI == "" || params.SubjectCID == "" {
-		return nil, fmt.Errorf("subject URI and CID are required")
+	if params.OwnerSlashRepo == "" {
+		return nil, fmt.Errorf("owner/repo is required")
+	}
+	if params.IssueID <= 0 {
+		return nil, fmt.Errorf("issue ID is required")
+	}
+
+	// Resolve the issue or PR to get its AT-URI and CID
+	subjectURI, subjectCID, err := c.resolveSubject(ctx, params.OwnerSlashRepo, params.IssueID)
+	if err != nil {
+		return nil, err
 	}
 
 	rkey := generateTID()
@@ -24,13 +32,13 @@ func (c *Client) CreateComment(ctx context.Context, params CreateCommentParams) 
 	record := map[string]any{
 		"$type": CollectionComment,
 		"body": map[string]any{
-			"$type":     "sh.tangled.markup.markdown",
-			"text":      params.Body,
-			"original":  params.Body,
+			"$type":    "sh.tangled.markup.markdown",
+			"text":     params.Body,
+			"original": params.Body,
 		},
 		"subject": map[string]any{
-			"uri": params.SubjectURI,
-			"cid": params.SubjectCID,
+			"uri": subjectURI,
+			"cid": subjectCID,
 		},
 		"createdAt": nowISO(),
 	}
@@ -52,24 +60,23 @@ func (c *Client) CreateComment(ctx context.Context, params CreateCommentParams) 
 	}
 
 	return &Comment{
-		URI:         uri,
-		CID:         cid,
-		Body:        params.Body,
-		SubjectURI:  params.SubjectURI,
-		SubjectCID:  params.SubjectCID,
-		ReplyToURI:  params.ReplyToURI,
-		ReplyToCID:  params.ReplyToCID,
-		CreatedAt:   record["createdAt"].(string),
+		URI:        uri,
+		CID:        cid,
+		Body:       params.Body,
+		SubjectURI: subjectURI,
+		SubjectCID: subjectCID,
+		ReplyToURI: params.ReplyToURI,
+		ReplyToCID: params.ReplyToCID,
+		CreatedAt:  record["createdAt"].(string),
 	}, nil
 }
 
-// ListComments lists comments on an issue or pull request.
-// It queries the repo owner's PDS for records in the sh.tangled.feed.comment collection
-// that reference the given subject URI.
+// ListComments lists comments on a repository, optionally filtered to a specific issue or PR.
+// If issueID is 0, all comments from the repo owner's PDS are returned.
 //
 // Note: This only finds comments from users on the same PDS as the repo owner.
 // Comments from other PDS instances are not visible via this method.
-func (c *Client) ListComments(ctx context.Context, ownerSlashRepo string, subjectURI string, limit int) ([]*Comment, error) {
+func (c *Client) ListComments(ctx context.Context, ownerSlashRepo string, issueID int, limit int) ([]*Comment, error) {
 	repoInfo, err := c.ResolveRepo(ctx, ownerSlashRepo)
 	if err != nil {
 		return nil, err
@@ -94,6 +101,15 @@ func (c *Client) ListComments(ctx context.Context, ownerSlashRepo string, subjec
 		return nil, fmt.Errorf("failed to list comments: %w", err)
 	}
 
+	// If an issueID is given, resolve the subject AT-URI for filtering
+	var subjectURI string
+	if issueID > 0 {
+		subjectURI, _, err = c.resolveSubject(ctx, ownerSlashRepo, issueID)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	var comments []*Comment
 	for _, rec := range records {
 		comment := rawRecordToComment(rec)
@@ -108,6 +124,32 @@ func (c *Client) ListComments(ctx context.Context, ownerSlashRepo string, subjec
 	}
 
 	return comments, nil
+}
+
+// resolveSubject finds the AT-URI and CID for an issue or PR by its numeric ID.
+// It tries issues first, then falls back to PRs. Works with both public and authenticated clients.
+func (c *Client) resolveSubject(ctx context.Context, ownerSlashRepo string, id int) (uri, cid string, err error) {
+	// Try issues first — ListIssues works without auth
+	issues, err := c.ListIssues(ctx, ownerSlashRepo, 100)
+	if err == nil {
+		for _, issue := range issues {
+			if issue.ID == id {
+				return issue.URI, issue.CID, nil
+			}
+		}
+	}
+
+	// Fall back to PRs
+	pulls, err := c.ListPulls(ctx, ownerSlashRepo, 100)
+	if err == nil {
+		for _, p := range pulls {
+			if p.ID == id {
+				return p.URI, p.CID, nil
+			}
+		}
+	}
+
+	return "", "", fmt.Errorf("issue or PR #%d not found on %s", id, ownerSlashRepo)
 }
 
 // rawRecordToComment converts a raw pdsRecord to a Comment.

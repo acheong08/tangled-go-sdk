@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"fmt"
+	"os"
+	"text/tabwriter"
 
 	"github.com/acheong08/tangled-go-sdk"
 	"github.com/spf13/cobra"
@@ -11,7 +13,7 @@ import (
 func commentCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "comment",
-		Short: "Comment on an issue or pull request",
+		Short: "Comment on issues and pull requests",
 	}
 
 	cmd.AddCommand(commentCreateCmd())
@@ -25,12 +27,11 @@ func commentCreateCmd() *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:   "create <owner/repo> <issue-or-pr-id>",
-		Short: "Create a comment on an issue or pull request",
-		Long: `Create a comment on an issue or pull request.
+		Short: "Comment on an issue or pull request",
+		Long: `Comment on an issue or pull request.
 
-The ID refers to the issue or PR number (e.g., #1, #42).
-The command first looks up the issue or PR to get its AT-URI and CID,
-then creates the comment record on your PDS.`,
+The ID refers to the issue or PR number (e.g., 1, 42).
+The command resolves the issue/PR automatically.`,
 		Args: cobra.ExactArgs(2),
 		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
 			return initConfig()
@@ -42,51 +43,24 @@ then creates the comment record on your PDS.`,
 			}
 
 			if body == "" {
-				return fmt.Errorf("body is required (use --body)")
+				return fmt.Errorf("body is required (use --body or -m)")
 			}
 
-			var subjectURI, subjectCID string
-
-			// Try issue first, then PR
-			var issueID int
-			if _, err := fmt.Sscanf(args[1], "%d", &issueID); err != nil {
+			var id int
+			if _, err := fmt.Sscanf(args[1], "%d", &id); err != nil {
 				return fmt.Errorf("invalid ID %q: %w", args[1], err)
 			}
 
-			issue, err := client.GetIssue(context.Background(), args[0], issueID)
-			if err == nil && issue != nil {
-				subjectURI = issue.URI
-				subjectCID = issue.CID
-			} else {
-				// Try PRs
-				pulls, err := client.ListPulls(context.Background(), args[0], 100)
-				if err != nil {
-					return fmt.Errorf("failed to find issue or PR #%d: %w", issueID, err)
-				}
-				found := false
-				for _, p := range pulls {
-					if p.ID == issueID {
-						subjectURI = p.URI
-						subjectCID = p.CID
-						found = true
-						break
-					}
-				}
-				if !found {
-					return fmt.Errorf("issue or PR #%d not found", issueID)
-				}
-			}
-
 			comment, err := client.CreateComment(context.Background(), tangled.CreateCommentParams{
-				Body:        body,
-				SubjectURI:  subjectURI,
-				SubjectCID:  subjectCID,
+				Body:           body,
+				OwnerSlashRepo: args[0],
+				IssueID:        id,
 			})
 			if err != nil {
 				return err
 			}
 
-			fmt.Printf("Comment created: %s\n", comment.URI)
+			fmt.Printf("Comment created on #%d: %s\n", id, comment.URI)
 			return nil
 		},
 	}
@@ -98,13 +72,12 @@ then creates the comment record on your PDS.`,
 
 func commentListCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:   "list <owner/repo> [subject-uri]",
-		Short: "List comments on a repository",
+		Use:   "list <owner/repo> [issue-or-pr-id]",
+		Short: "List comments",
 		Long: `List comments on a repository.
 
-If a subject URI is provided (e.g., an issue AT-URI), only comments
-on that subject are returned. Otherwise, all comments from the repo
-owner's PDS are listed.`,
+If an issue/PR ID is given, only comments on that issue or PR are shown.
+Otherwise, all comments from the repo owner's PDS are listed.`,
 		Args: cobra.RangeArgs(1, 2),
 		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
 			return initConfig()
@@ -112,12 +85,14 @@ owner's PDS are listed.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			client := tangled.NewPublicClient()
 
-			subjectURI := ""
+			id := 0
 			if len(args) >= 2 {
-				subjectURI = args[1]
+				if _, err := fmt.Sscanf(args[1], "%d", &id); err != nil {
+					return fmt.Errorf("invalid ID %q: %w", args[1], err)
+				}
 			}
 
-			comments, err := client.ListComments(context.Background(), args[0], subjectURI, 50)
+			comments, err := client.ListComments(context.Background(), args[0], id, 50)
 			if err != nil {
 				return err
 			}
@@ -127,11 +102,11 @@ owner's PDS are listed.`,
 				return nil
 			}
 
+			tw := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
 			for _, c := range comments {
-				fmt.Printf("%s\n", c.Body)
-				fmt.Printf("  by %s at %s\n", c.URI, c.CreatedAt)
-				fmt.Println()
+				fmt.Fprintf(tw, "%s\t%s\n", c.Body, c.CreatedAt)
 			}
+			tw.Flush()
 			return nil
 		},
 	}

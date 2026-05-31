@@ -160,11 +160,10 @@ type Comment struct {
 type CreateCommentParams struct {
 	// Body is the comment text (required).
 	Body string
-	// SubjectURI is the AT-URI of the record to comment on (required).
-	// Typically an issue or PR AT-URI.
-	SubjectURI string
-	// SubjectCID is the CID of the record to comment on (required).
-	SubjectCID string
+	// OwnerSlashRepo is the repository in "owner/repo" format (required).
+	OwnerSlashRepo string
+	// IssueID is the issue or PR number to comment on (required).
+	IssueID int
 	// ReplyToURI is the AT-URI of the parent comment for threaded replies (optional).
 	ReplyToURI string
 	// ReplyToCID is the CID of the parent comment (required if ReplyToURI is set).
