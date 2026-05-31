@@ -405,7 +405,8 @@ func extractDIDFromATURI(uri string) (string, error) {
 	if !strings.HasPrefix(uri, "at://") {
 		return "", fmt.Errorf("not an AT-URI: %q", uri)
 	}
-	parts := strings.SplitN(uri, "/", 3)
+	// at://did:plc:xxx/collection/rkey → ["at:", "", "did:plc:xxx", "collection", "rkey"]
+	parts := strings.Split(uri, "/")
 	if len(parts) < 3 {
 		return "", fmt.Errorf("invalid AT-URI: %q", uri)
 	}
