@@ -136,6 +136,41 @@ type CreatePullParams struct {
 	TargetBranch string
 }
 
+// Comment represents a Tangled comment on an issue or pull request.
+type Comment struct {
+	// URI is the AT-URI of the comment record.
+	URI string `json:"uri"`
+	// CID is the content identifier of the record.
+	CID string `json:"cid"`
+	// Body is the comment text.
+	Body string `json:"body"`
+	// SubjectURI is the AT-URI of the record this comment is on (issue/PR/comment).
+	SubjectURI string `json:"subjectUri"`
+	// SubjectCID is the CID of the record this comment is on.
+	SubjectCID string `json:"subjectCid"`
+	// ReplyToURI is the AT-URI of the parent comment (for threaded replies). Empty for top-level comments.
+	ReplyToURI string `json:"replyToUri,omitempty"`
+	// ReplyToCID is the CID of the parent comment.
+	ReplyToCID string `json:"replyToCid,omitempty"`
+	// CreatedAt is the ISO 8601 timestamp of when the comment was created.
+	CreatedAt string `json:"createdAt"`
+}
+
+// CreateCommentParams contains the parameters for creating a comment.
+type CreateCommentParams struct {
+	// Body is the comment text (required).
+	Body string
+	// SubjectURI is the AT-URI of the record to comment on (required).
+	// Typically an issue or PR AT-URI.
+	SubjectURI string
+	// SubjectCID is the CID of the record to comment on (required).
+	SubjectCID string
+	// ReplyToURI is the AT-URI of the parent comment for threaded replies (optional).
+	ReplyToURI string
+	// ReplyToCID is the CID of the parent comment (required if ReplyToURI is set).
+	ReplyToCID string
+}
+
 // generateTID returns a Timestamp ID string suitable for use as an atproto record key.
 func generateTID() string {
 	return fmt.Sprintf("%d", time.Now().UnixMicro())

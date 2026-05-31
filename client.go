@@ -30,6 +30,9 @@ const (
 	// CollectionLabelOp is the atproto collection for Tangled label operation records.
 	CollectionLabelOp = "sh.tangled.label.op"
 
+	// CollectionComment is the atproto collection for Tangled comment records.
+	CollectionComment = "sh.tangled.feed.comment"
+
 	// DefaultPDS is the default PDS host for Bluesky.
 	DefaultPDS = "https://bsky.social"
 )
