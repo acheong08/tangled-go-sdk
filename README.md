@@ -59,9 +59,16 @@ repos, _ := client.ListMyRepos(ctx)
 
 // Create an issue
 issue, _ := client.CreateIssue(ctx, "owner/repo", tangled.CreateIssueParams{
-    Title: "Bug report",
-    Body:  "Something is broken",
+    Title:  "Bug report",
+    Body:   "Something is broken",
     Labels: []string{"bug"},
+})
+
+// Comment on the issue
+comment, _ := client.CreateComment(ctx, tangled.CreateCommentParams{
+    Body:           "Confirmed, I can reproduce this.",
+    OwnerSlashRepo: "owner/repo",
+    SubjectRef:     "1", // issue ID as a string
 })
 
 // Update an issue (use StringPtr for fields you want to change)
@@ -86,10 +93,10 @@ client.DeleteIssue(ctx, "owner/repo", issue.ID)
 
 ### Repository Operations
 
-| Method                           | Auth     | Description                                        |
-| -------------------------------- | -------- | -------------------------------------------------- |
-| `ResolveRepo(ctx, "owner/repo")` | Either   | Resolve repo name to metadata (knot, DID, RepoDID) |
-| `ListMyRepos(ctx)`               | Required | List the authenticated user's repositories         |
+| Method                            | Auth     | Description                                        |
+| --------------------------------- | -------- | -------------------------------------------------- |
+| `ResolveRepo(ctx, "owner/repo")`  | Either   | Resolve repo name to metadata (knot, DID, RepoDID) |
+| `ListMyRepos(ctx)`                | Required | List the authenticated user's repositories          |
 
 ### Issue Operations
 
@@ -102,20 +109,54 @@ client.DeleteIssue(ctx, "owner/repo", issue.ID)
 | `DeleteIssue(ctx, "owner/repo", id)`     | Required | Delete an issue                       |
 | `ListLabels(ctx, "owner/repo")`          | Either   | List available label names for a repo |
 
-### Pull Request Operations
+### Comment Operations
 
-| Method                                      | Auth     | Description                        |
-| ------------------------------------------- | -------- | ---------------------------------- |
-| `ListPulls(ctx, "owner/repo", limit)`       | Either   | List PRs for a repo                |
-| `ListPublicPulls(ctx, "owner/repo", limit)` | Either   | List PRs from the repo owner's PDS |
-| `GetPull(ctx, rkey)`                        | Required | Get a specific PR by record key    |
-| `CreatePull(ctx, "owner/repo", params)`     | Required | Create a new PR                    |
+| Method                                           | Auth     | Description                                                                 |
+| ------------------------------------------------ | -------- | --------------------------------------------------------------------------- |
+| `CreateComment(ctx, params)`                     | Required | Create a comment on an issue                                                |
+| `ListComments(ctx, "owner/repo", subjectRef, limit)` | Either   | List comments, optionally filtered by subject                               |
+
+`CreateCommentParams.SubjectRef` can be:
+- A numeric issue ID like `"1"` — resolved via the issue list
+- A full AT-URI like `"at://did:plc:.../sh.tangled.repo.issue/rkey"` — fetched directly
 
 ### Branch Operations
 
 | Method                                   | Auth   | Description                       |
 | ---------------------------------------- | ------ | --------------------------------- |
 | `ListBranches(ctx, "owner/repo", limit)` | Either | List branches via the knot server |
+
+## CLI
+
+An example CLI is included at `examples/cli/`:
+
+```bash
+# Build
+cd examples/cli && go build -o tangled .
+
+# Login (saves credentials to ~/.config/tangled/config.toml)
+tangled login
+tangled login user.bsky.social xxxx-xxxx-xxxx-xxxx
+
+# Identity
+tangled whoami
+
+# Repos
+tangled repo list
+
+# Issues
+tangled issue list owner/repo
+tangled issue create owner/repo -t "Bug report" -b "Description" -l bug
+tangled issue show owner/repo 1
+tangled issue close owner/repo 1
+tangled issue comment owner/repo 1 -m "Confirmed"
+
+# Branches
+tangled branch list owner/repo
+
+# Labels
+tangled label list owner/repo
+```
 
 ## Architecture
 
@@ -124,8 +165,7 @@ PDS (Personal Data Server), not on a central server:
 
 - **Repositories** are records (`sh.tangled.repo`) on the owner's PDS
 - **Issues** are records (`sh.tangled.repo.issue`) on the **creator's** PDS
-- **Pull requests** are records (`sh.tangled.repo.pull`) on the **creator's**
-  PDS
+- **Comments** are records (`sh.tangled.feed.comment`) on the **commenter's** PDS
 - **Branches** are queried from the **knot server** (the git host)
 
 This library authenticates via `com.atproto.server.createSession`, then uses raw
@@ -136,30 +176,35 @@ standard AT Protocol auth operations.
 
 ## Known Limitations
 
-### Issue and PR listings are incomplete
+### Issue listings are incomplete
 
-**This is the most important limitation.** The AT Protocol stores issues and PRs
-on the **creator's** PDS, not on the repo owner's PDS. When you call
-`ListIssues` or `ListPulls`, the library queries a single PDS at a time:
+The AT Protocol stores issues on the **creator's** PDS, not on the repo owner's
+PDS. When you call `ListIssues`, the library queries a single PDS at a time:
 
 - **Authenticated `ListIssues`**: queries the **authenticated user's** PDS →
   only shows issues **you** created on that repo.
 - **Public `ListIssues`**: queries the **repo owner's** PDS → only shows issues
   the **repo owner** created.
-- **Same applies to `ListPulls` / `ListPublicPulls`**.
 
-For a popular repo like `tangled.org/core` (which has 100+ PRs from many
-contributors), querying any single PDS will only return a small fraction of the
-total. Most PRs and issues from other contributors are invisible because they
-live on their own PDS instances.
+For a popular repo with many contributors, querying any single PDS will only
+return a small fraction of the total. Issues from other contributors are
+invisible because they live on their own PDS instances.
 
 The Tangled website (tangled.org) shows complete listings because its
 **appview** subscribes to the AT Protocol firehose and aggregates all records
 from all PDS instances into a single database. However, the appview **does not
 expose a public JSON/XRPC query API** — it only renders HTML server-side.
 
-**Impact**: You cannot build a complete issue/PR listing through this library
-(or any PDS-based approach). Only the Tangled appview has the full picture.
+**Impact**: You cannot build a complete issue listing through this library (or
+any PDS-based approach). Only the Tangled appview has the full picture.
+
+### No pull request support
+
+Pull request records created via the Tangled web UI do not include a `pullId`
+field — the PR number is assigned by the appview, not stored in the PDS record.
+Without a public appview API, there is no reliable way to map PR numbers to
+PDS records or list PRs from PDS queries alone. PR support has been removed
+until the appview exposes a query API.
 
 ### Issue ID collisions
 
@@ -171,12 +216,11 @@ simultaneously might both get the same ID.
 The Tangled appview manages a definitive ID sequence, but there is no API to
 query it.
 
-### PR creation may not appear on tangled.org
+### Comment listings are incomplete
 
-The Tangled appview may not subscribe to `sh.tangled.repo.pull` from the AT
-Protocol firehose in all deployments. PRs created via raw PDS records might not
-be indexed by the appview, meaning they won't appear on tangled.org even though
-the record exists on your PDS.
+`ListComments` queries the repo owner's PDS, so it only finds comments from
+users on that same PDS. Comments from contributors on other PDS instances are
+not visible.
 
 ### ListLabels resolution
 
@@ -196,7 +240,7 @@ with more than 100 records in a collection, older records will be truncated.
 Some Tangled repositories have two `sh.tangled.repo` records on the owner's PDS
 — an older one with a TID rkey and explicit `name` field, and a newer one with a
 human-readable rkey and no `name` field. This library prefers the older
-(canonical) record, which is the one referenced by existing issues and PRs.
+(canonical) record, which is the one referenced by existing issues.
 
 ## Development
 
