@@ -3,6 +3,9 @@
 A Go client library for the [Tangled](https://tangled.org) git collaboration
 platform, built on the [AT Protocol](https://atproto.com).
 
+> [!CAUTION]
+> DO NOT USE. THIS IS A VIBE CODING EXPERIMENT. WHILE I DID HAVE INPUT OVER DESIGN AND TESTING, I DID NOT REVIEW EVERY LINE OF CODE.
+
 ## Install
 
 ```bash

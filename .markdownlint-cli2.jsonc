@@ -1,0 +1,17 @@
+{
+	"$schema": "https://raw.githubusercontent.com/DavidAnson/markdownlint-cli2/main/schema/markdownlint-cli2-config-schema.json",
+	"config": {
+		"MD013": false,
+		"MD024": {
+			"siblings_only": true
+		},
+		"MD033": {
+			"allowed_elements": [
+				"br"
+			]
+		},
+		"MD036": false,
+		"MD041": false
+	},
+	"fix": true
+}
